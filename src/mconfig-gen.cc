@@ -67,5 +67,7 @@ int main(int argc, char **argv)
     cout << "\n// Constants\n";
     cout << "constexpr static char SYSCONTROLSOCKET[] = " << stringify(vars["SYSCONTROLSOCKET"]) << ";\n";
     cout << "constexpr static char SBINDIR[] = " << stringify(vars["SBINDIR"]) << ";\n";
+    cout << "constexpr static char SYSENVIRONMENT[] = " << stringify(vars["SYSENVIRONMENT"]) << ";\n";
+    cout << "constexpr static char SYSSERVICEDIR[] = " << stringify(vars["SYSSERVICEDIR"]) << ";\n";
     return 0;
 }

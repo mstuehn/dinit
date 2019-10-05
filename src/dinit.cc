@@ -80,7 +80,7 @@ int active_control_conns = 0;
 static const char *control_socket_path = SYSCONTROLSOCKET;
 static std::string control_socket_str;
 
-static const char *env_file_path = "/etc/dinit/environment";
+static const char *env_file_path = SYSENVIRONMENT; //"/etc/dinit/environment";
 
 static const char *log_path = "/dev/log";
 static bool log_is_syslog = true; // if false, log is a file
@@ -417,7 +417,7 @@ int dinit_main(int argc, char **argv)
 
     bool add_all_service_dirs = false;
     if (service_dir == nullptr) {
-        service_dir = "/etc/dinit.d";
+        service_dir = SYSSERVICEDIR; //"/etc/dinit.d";
         add_all_service_dirs = true;
     }
 

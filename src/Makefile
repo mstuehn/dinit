@@ -27,7 +27,10 @@ all: dinit dinitctl $(SHUTDOWN)
 	fi
 
 includes/mconfig.h: mconfig-gen
-	./mconfig-gen SBINDIR=$(SBINDIR) SYSCONTROLSOCKET=$(SYSCONTROLSOCKET) \
+	./mconfig-gen	SBINDIR=$(SBINDIR) \
+			SYSCONTROLSOCKET=$(SYSCONTROLSOCKET) \
+			SYSSERVICEDIR=$(SYSSERVICEDIR) \
+			SYSENVIRONMENT=$(SYSENVIRONMENT) \
 		$(if $(USE_UTMPX),USE_UTMPX=$(USE_UTMPX),) > includes/mconfig.h
 
 mconfig-gen: mconfig-gen.cc ../mconfig
