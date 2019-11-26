@@ -50,8 +50,31 @@ void service_record::stopped() noexcept
 
     force_stop = false;
 
-    bool will_restart = (desired_state == service_state_t::STARTED)
-            && !services->is_shutting_down();
+    restarting |= auto_restart;
+    bool will_restart = restarting && required_by > 0;
+    if (restarting && ! will_restart) {
+        notify_listeners(service_event_t::STARTCANCELLED);
+    }
+    restarting = false;
+
+    // If we won't restart, break soft dependencies now
+    if (! will_restart) {
+        for (auto dept : dependents) {
+            if (! dept->is_hard()) {
+                // waits-for or soft dependency:
+                if (dept->waiting_on) {
+                    dept->waiting_on = false;
+                    dept->get_from()->dependency_started();
+                }
+                if (dept->holding_acq) {
+                    dept->holding_acq = false;
+                    // release without issuing stop, since we're called only when this
+                    // service is already stopped/stopping:
+                    release(false);
+                }
+            }
+        }
+    }
 
     for (auto & dependency : depends_on) {
         // we signal dependencies in case they are waiting for us to stop:
@@ -107,14 +130,6 @@ void service_record::stopped() noexcept
     notify_listeners(service_event_t::STOPPED);
 }
 
-bool service_record::do_auto_restart() noexcept
-{
-    if (auto_restart) {
-        return !services->is_shutting_down();
-    }
-    return false;
-}
-
 void service_record::require() noexcept
 {
     if (required_by++ == 0) {
@@ -134,9 +149,11 @@ void service_record::release(bool issue_stop) noexcept
 
         // Can stop, and can release dependencies now. We don't need to issue a release if
         // the require was pending though:
-        prop_release = !prop_require;
-        prop_require = false;
-        services->add_prop_queue(this);
+        if (service_state != service_state_t::STOPPED && service_state != service_state_t::STOPPING) {
+            prop_release = !prop_require;
+            prop_require = false;
+            services->add_prop_queue(this);
+        }
 
         if (service_state == service_state_t::STOPPED) {
             services->service_inactive(this);
@@ -167,8 +184,6 @@ void service_record::start(bool activate) noexcept
         require();
         start_explicit = true;
     }
-    
-    if (desired_state == service_state_t::STARTED && service_state != service_state_t::STOPPED) return;
 
     bool was_active = service_state != service_state_t::STOPPED || desired_state != service_state_t::STOPPED;
     desired_state = service_state_t::STARTED;
@@ -176,9 +191,15 @@ void service_record::start(bool activate) noexcept
     if (service_state != service_state_t::STOPPED) {
         // We're already starting/started, or we are stopping and need to wait for
         // that the complete.
-        if (service_state != service_state_t::STOPPING || ! can_interrupt_stop()) {
+        if (service_state != service_state_t::STOPPING) {
             return;
         }
+
+        if (! can_interrupt_stop()) {
+            restarting = true;
+            return;
+        }
+
         // We're STOPPING, and that can be interrupted. Our dependencies might be STOPPING,
         // but if so they are waiting (for us), so they too can be instantly returned to
         // STARTING state.
@@ -243,6 +264,14 @@ void service_record::execute_transition() noexcept
     else if (service_state == service_state_t::STOPPING) {
         if (stop_check_dependents()) {
             waiting_for_deps = false;
+
+            // A service that does actually stop for any reason should have its explicit activation released, unless
+            // it will restart:
+            if (start_explicit && !auto_restart && !restarting) {
+                start_explicit = false;
+                release(false);
+            }
+
             bring_down();
         }
     }
@@ -322,6 +351,7 @@ void service_record::all_deps_started() noexcept
     }
 
     bool start_success = bring_up();
+    restarting = false;
     if (! start_success) {
         failed_to_start();
     }
@@ -454,27 +484,12 @@ void service_record::stop(bool bring_down) noexcept
 {
     if (start_explicit) {
         start_explicit = false;
-        release();
+        required_by--;
     }
 
-    // If it's a manual bring-down, we'll also break holds from waits-for dependencies, to avoid
-    // bouncing back up again -- but only if all holds are from waits-for dependencies.
-    if (bring_down) {
-        if (std::all_of(dependents.begin(), dependents.end(), [](service_dep * x) {
-            return x->dep_type == dependency_type::WAITS_FOR || x->dep_type == dependency_type::SOFT; }))
-        {
-            for (auto dept : dependents) {
-                if (dept->waiting_on) {
-                    dept->waiting_on = false;
-                    dept->get_from()->dependency_started();
-                }
-                if (dept->holding_acq) {
-                    dept->holding_acq = false;
-                    // release without issuing stop, since we issue stop if necessary below
-                    release(false);
-                }
-            }
-        }
+    // If our required_by count is 0, we should treat this as a full manual stop regardless
+    if (required_by == 0) {
+        bring_down = true;
     }
 
     if (bring_down && service_state != service_state_t::STOPPED
@@ -484,14 +499,25 @@ void service_record::stop(bool bring_down) noexcept
     }
 }
 
+bool service_record::restart() noexcept
+{
+    // Re-start without affecting dependency links/activation.
+
+    if (service_state == service_state_t::STARTED) {
+        restarting = true;
+        stop_reason = stopped_reason_t::NORMAL;
+        do_stop();
+        return true;
+    }
+
+    // Wrong state
+    return false;
+}
+
 void service_record::do_stop() noexcept
 {
-    // A service that does actually stop for any reason should have its explicit activation released, unless
-    // it will restart:
-    if (start_explicit && ! do_auto_restart()) {
-        start_explicit = false;
-        release(false);
-    }
+    // Called when we should definitely stop. We may need to restart afterwards, but we
+    // won't know that for sure until the execution transition.
 
     bool all_deps_stopped = stop_dependents();
 
@@ -532,6 +558,11 @@ void service_record::do_stop() noexcept
 
     if (pinned_started) return;
 
+    if (required_by == 0) {
+        prop_release = true;
+        services->add_prop_queue(this);
+    }
+
     service_state = service_state_t::STOPPING;
     waiting_for_deps = true;
     if (all_deps_stopped) {
@@ -543,12 +574,12 @@ bool service_record::stop_check_dependents() noexcept
 {
     bool all_deps_stopped = true;
     for (auto dept : dependents) {
-        if (dept->dep_type == dependency_type::REGULAR && ! dept->get_from()->is_stopped()) {
+        if (dept->is_hard() && dept->holding_acq) {
             all_deps_stopped = false;
             break;
         }
     }
-    
+
     return all_deps_stopped;
 }
 
@@ -556,9 +587,7 @@ bool service_record::stop_dependents() noexcept
 {
     bool all_deps_stopped = true;
     for (auto dept : dependents) {
-        if (dept->dep_type == dependency_type::REGULAR ||
-                (dept->dep_type == dependency_type::MILESTONE &&
-                dept->get_from()->service_state != service_state_t::STARTED)) {
+        if (dept->is_hard() && dept->holding_acq) {
             if (! dept->get_from()->is_stopped()) {
                 // Note we check *first* since if the dependent service is not stopped,
                 // 1. We will issue a stop to it shortly and
@@ -574,19 +603,6 @@ bool service_record::stop_dependents() noexcept
 
             dept->get_from()->prop_stop = true;
             services->add_prop_queue(dept->get_from());
-        }
-        else {
-            // waits-for or soft dependency:
-            if (dept->waiting_on) {
-                dept->waiting_on = false;
-                dept->get_from()->dependency_started();
-            }
-            if (dept->holding_acq && !auto_restart) {
-                dept->holding_acq = false;
-                // release without issuing stop, since we should be called only when this
-                // service is already stopped/stopping:
-                release(false);
-            }
         }
     }
 
@@ -604,6 +620,19 @@ void service_record::unpin() noexcept
 {
     if (pinned_started) {
         pinned_started = false;
+
+        for (auto &dep : depends_on) {
+            if (dep.is_hard()) {
+                if (dep.get_to()->get_state() != service_state_t::STARTED) {
+                    desired_state = service_state_t::STOPPED;
+                }
+            }
+            else if (dep.holding_acq) {
+                dep.holding_acq = false;
+                dep.get_to()->release();
+            }
+        }
+
         if (desired_state == service_state_t::STOPPED || force_stop) {
             do_stop();
             services->process_queues();

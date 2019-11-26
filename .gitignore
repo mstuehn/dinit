@@ -3,6 +3,7 @@
 /src/**/*.d
 /src/dinit
 /src/dinitctl
+/src/dinitcheck
 /src/shutdown
 /src/mconfig-gen
 /src/includes/mconfig.h
@@ -22,3 +23,10 @@
 /src/igr-tests/environ/env-record
 /src/igr-tests/ps-environ/env-record
 /src/igr-tests/chain-to/recorded-output
+/src/igr-tests/restart/basic-ran
+/src/igr-tests/check-basic/output.txt
+/src/igr-tests/check-cycle/output.txt
+
+# Generated man pages:
+/doc/manpages/*.5
+/doc/manpages/*.8

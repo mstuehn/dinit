@@ -34,6 +34,65 @@ class cp_old_server_exception
 };
 
 
+
+// static_membuf: a buffer of a fixed size (N) with one additional value (of type T). Don't use this
+// directly, construct via membuf.
+template <int N> class static_membuf
+{
+    public:
+    static constexpr int size() { return N; }
+
+    private:
+    char buf[N];
+
+    public:
+    template <typename T>
+    static_membuf(const T &val)
+    {
+        static_assert(sizeof(T) == N);
+        memcpy(buf, &val, N);
+    }
+
+    template <int M, typename T>
+    static_membuf(char (&prevbuf)[M], const T &val)
+    {
+        static_assert(M + sizeof(T) == N);
+        memcpy(buf, prevbuf, M);
+        memcpy(buf + M, &val, sizeof(val));
+    }
+
+    const char *data() const { return buf; }
+
+    template <typename U> static_membuf<N+sizeof(U)> append(const U &u)
+    {
+        return static_membuf<N+sizeof(U)>{buf, u};
+    }
+
+    void output(char *out)
+    {
+        memcpy(out, buf, size());
+    }
+};
+
+// "membuf" class provides a compile-time allocated buffer that we can add items to one-by-one. This is
+// much safer than working with raw buffers and calculating offsets and sizes by hand (and with a decent
+// compiler the end result is just as efficient).
+//
+// To use:
+//     auto m = membuf().append(value1).append(value2).append(value3);
+// Then:
+//     m.size() - returns total size of the buffer (sizeof(value1)+...)
+//     m.data() - returns a 'const char *' to the buffer contents
+class membuf
+{
+    public:
+
+    template <typename U> static_membuf<sizeof(U)> append(const U &u)
+    {
+        return static_membuf<sizeof(U)>(u);
+    }
+};
+
 // Fill a circular buffer from a file descriptor, until it contains at least _rlength_ bytes.
 // Throws cp_read_exception if the requested number of bytes cannot be read, with:
 //     errcode = 0   if end of stream (remote end closed)
@@ -112,6 +171,12 @@ inline void write_all_x(int fd, const void *buf, size_t count)
     if (write_all(fd, buf, count) == -1) {
         throw cp_write_exception(errno);
     }
+}
+
+// Write all the requested buffer (eg membuf) and throw an exception on failure.
+template <typename Buf> inline void write_all_x(int fd, const Buf &b)
+{
+    write_all_x(fd, b.data(), b.size());
 }
 
 // Check the protocol version is compatible with the client.

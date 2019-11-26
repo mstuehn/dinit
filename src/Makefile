@@ -10,11 +10,11 @@ ifeq ($(BUILD_SHUTDOWN),yes)
 endif
 
 dinit_objects = dinit.o load-service.o service.o proc-service.o baseproc-service.o control.o dinit-log.o \
-		dinit-main.o run-child-proc.o
+		dinit-main.o run-child-proc.o options-processing.o
 
-objects = $(dinit_objects) dinitctl.o shutdown.o
+objects = $(dinit_objects) dinitctl.o dinitcheck.o shutdown.o
 
-all: dinit dinitctl $(SHUTDOWN)
+all: dinit dinitctl dinitcheck $(SHUTDOWN)
 
 # Look for a suitable build config file and use it.
 ../mconfig:
@@ -36,13 +36,16 @@ includes/mconfig.h: mconfig-gen
 mconfig-gen: mconfig-gen.cc ../mconfig
 	$(HOSTCXX) $(HOSTCXXOPTS) -o mconfig-gen mconfig-gen.cc $(HOSTLDFLAGS)
 
-$(dinit_objects): includes/mconfig.h
+$(objects): includes/mconfig.h
 
 dinit: $(dinit_objects)
 	$(CXX) -o dinit $(dinit_objects) $(LDFLAGS)
 
 dinitctl: dinitctl.o
 	$(CXX) -o dinitctl dinitctl.o $(LDFLAGS)
+
+dinitcheck: dinitcheck.o options-processing.o
+	$(CXX) -o dinitcheck dinitcheck.o options-processing.o $(LDFLAGS)
 
 shutdown: shutdown.o
 	$(CXX) -o shutdown shutdown.o $(LDFLAGS)
@@ -53,7 +56,7 @@ $(objects): %.o: %.cc
 check:
 	$(MAKE) -C tests check
 
-check-igr: dinit dinitctl
+check-igr: dinit dinitctl dinitcheck
 	$(MAKE) -C igr-tests check-igr
 
 run-cppcheck:
@@ -61,7 +64,7 @@ run-cppcheck:
 
 install: all
 	install -d $(DESTDIR)$(SBINDIR)
-	install $(STRIPOPTS) dinit dinitctl $(SHUTDOWN) $(DESTDIR)$(SBINDIR)
+	install $(STRIPOPTS) dinit dinitctl dinitcheck $(SHUTDOWN) $(DESTDIR)$(SBINDIR)
 ifeq ($(BUILD_SHUTDOWN),yes)
 	ln -f $(DESTDIR)$(SBINDIR)/shutdown $(DESTDIR)$(SBINDIR)/halt
 	ln -f $(DESTDIR)$(SBINDIR)/shutdown $(DESTDIR)$(SBINDIR)/reboot
@@ -69,7 +72,7 @@ endif
 
 clean:
 	rm -f *.o *.d
-	rm -f dinit dinitctl shutdown mconfig-gen
+	rm -f dinit dinitctl dinitcheck shutdown mconfig-gen
 	rm -f includes/mconfig.h
 	$(MAKE) -C tests clean
 	$(MAKE) -C igr-tests clean

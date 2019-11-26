@@ -1,24 +1,28 @@
-For version 0.6.0:
+For version 0.8.0:
 ------------------
-* Refuse to start new services during shutdown [DONE].
-* On service failure (all services stop when no restart issued), allow user to
-  interrupt/ctrl+alt+del when they are prompted to press enter, to allow halt/rebooting instead of
-  re-launching the boot service.  [DONE][ even better, you can now choose from several options! ]
-* Basic resource limits setting. [DONE, mostly. OpenBSD compilation issues, others need testing].
-* Per-service environment. [DONE].
-* shares_console processes should not be set as foreground process group [DONE]
-* Process start failure: track where in the launch process we get failure (i.e. we send errno over a pipe,
-  we should send a state value as well).
+* provide a way to check configuration for errors (dinitcheck command) [DONE]
+* Easy way to reload service description (including if service is running, where possible).
+* report process launch failure reason (stage & errno) via dinitctl.
+* "chain-to" can result in an unbreakable loop if the chain is circular. Chained services should not be
+  started during shutdown to prevent this (also avoids a race condition where the chained service is left
+  running when everything else has shutdown).
+* Show "activated" state in "dinitctl list" output
 
-For version 0.7.0:
+For version 0.9.+:
 ------------------
-* dinitctl: Warn when stopping a service would cause a dependent to stop. Require a force flag to proceed.
-* dinitctl: implement "restart" command. 
-* provide a way to check configuration for errors (maybe a dinitctl command)
-  - eg. check a service and all dependencies
+* Service description sanity checks:
+  - Service type not specified
+    - maybe default to 'internal' if command not specified
+  - service command not specified
+  - errors should also be reported by dinitcheck
 
 For version 1.0:
 ----------------
+* Service description parse errors should report line number
+* dinitcheck should perform lint checks - do named files exist? etc
+* Limit memory use by control connections. Currently clients can queue commands without limit.
+* Consider using mlockall (if system process).
+* Dinitctl command to get full status of a service.
 * "triggered" service type: external process notifies Dinit when the service
   has started. (maybe?)
   - key thing is we want some way to eg mount filesystem once the disk comes up,
@@ -28,7 +32,8 @@ For version 1.0:
   about services we are waiting on (or, do this when prompted via ^C or C-A-D).
 * Documentation must be complete (see section below).
 * Proper support for socket activation?
-* Be able to boot and shutdown Linux and FreeBSD.
+* Chaining of service process input/output?
+* Be able to boot and shutdown Linux and FreeBSD (or OpenBSD).
 
 For later:
 ----------
@@ -79,19 +84,4 @@ Even later / Maybe never:
 Documentation:
 --------------
 * Design philosophy/rationale document
-* Coding style guidelines
-
-* What's the best TERM setting? gogetty gives me "linux" but I think other variants may be
-  better (eg "linux-c").
-
-* Figure out the ConsoleKit/logind / PolicyKit mess & how dinit needs to fit into it.
-  * Consolekit/logind tracks "sessions". Provides a mechanism to mark a session starting,
-    associates processes with sessions, provides calls to terminate sessions etc (why?!!)
-    Can use environment variable or cgroups to track processes in a session.
-    A PAM module exists to create/destroy sessions.
-  * Consolekit/logind also allows for requesting shutdown, reboot, and inhibiting reboot
-    (via dbus API).
-  * "seats" are a set of input/output hardware (mouse/keyboard/monitor) on which a session
-    can be run. You can have multiple sessions on a seat - one is in the foreground
-    (eg linux virtual ttys implement multiple sessions on a single seat).
-    Sessions can run without a seat (eg ssh session).
+* More system integration documentation?

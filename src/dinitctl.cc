@@ -38,7 +38,7 @@ enum class command_t;
 static int issue_load_service(int socknum, const char *service_name, bool find_only = false);
 static int check_load_reply(int socknum, cpbuffer_t &, handle_t *handle_p, service_state_t *state_p);
 static int start_stop_service(int socknum, cpbuffer_t &, const char *service_name, command_t command,
-        bool do_pin, bool wait_for_service, bool verbose);
+        bool do_pin, bool do_force, bool wait_for_service, bool verbose);
 static int unpin_service(int socknum, cpbuffer_t &, const char *service_name, bool verbose);
 static int unload_service(int socknum, cpbuffer_t &, const char *service_name);
 static int list_services(int socknum, cpbuffer_t &);
@@ -63,6 +63,7 @@ enum class command_t {
     START_SERVICE,
     WAKE_SERVICE,
     STOP_SERVICE,
+    RESTART_SERVICE,
     RELEASE_SERVICE,
     UNPIN_SERVICE,
     UNLOAD_SERVICE,
@@ -90,9 +91,10 @@ int main(int argc, char **argv)
     const char * control_socket_path = nullptr;
     
     bool verbose = true;
-    bool sys_dinit = false;  // communicate with system daemon
+    bool user_dinit = (getuid() != 0);  // communicate with user daemon
     bool wait_for_service = true;
     bool do_pin = false;
+    bool do_force = false;
     
     command_t command = command_t::NONE;
         
@@ -109,12 +111,15 @@ int main(int argc, char **argv)
                 verbose = false;
             }
             else if (strcmp(argv[i], "--system") == 0 || strcmp(argv[i], "-s") == 0) {
-                sys_dinit = true;
+                user_dinit = false;
+            }
+            else if (strcmp(argv[i], "--user") == 0 || strcmp(argv[i], "-u") == 0) {
+                user_dinit = true;
             }
             else if (strcmp(argv[i], "--pin") == 0) {
                 do_pin = true;
             }
-            else if (strcmp(argv[i], "--socket-path") || strcmp(argv[i], "-p")) {
+            else if (strcmp(argv[i], "--socket-path") == 0 || strcmp(argv[i], "-p") == 0) {
                 ++i;
                 if (i == argc) {
                     cerr << "dinitctl: --socket-path/-p should be followed by socket path" << std::endl;
@@ -131,8 +136,12 @@ int main(int argc, char **argv)
                 }
                 service_name = argv[i];
             }
+            else if ((command == command_t::STOP_SERVICE || command == command_t::RESTART_SERVICE)
+                    && (strcmp(argv[i], "--force") == 0 || strcmp(argv[i], "-f") == 0)) {
+                do_force = true;
+            }
             else {
-                cerr << "dinitctl: unrecognized option: " << argv[i] << " (use --help for help)\n";
+                cerr << "dinitctl: unrecognized/invalid option: " << argv[i] << " (use --help for help)\n";
                 return 1;
             }
         }
@@ -145,6 +154,9 @@ int main(int argc, char **argv)
             }
             else if (strcmp(argv[i], "stop") == 0) {
                 command = command_t::STOP_SERVICE;
+            }
+            else if (strcmp(argv[i], "restart") == 0) {
+                command = command_t::RESTART_SERVICE;
             }
             else if (strcmp(argv[i], "release") == 0) {
                 command = command_t::RELEASE_SERVICE;
@@ -250,6 +262,7 @@ int main(int argc, char **argv)
           "Usage:\n"
           "    dinitctl [options] start [options] <service-name>\n"
           "    dinitctl [options] stop [options] <service-name>\n"
+          "    dinitctl [options] restart [options] <service-name>\n"
           "    dinitctl [options] wake [options] <service-name>\n"
           "    dinitctl [options] release [options] <service-name>\n"
           "    dinitctl [options] unpin <service-name>\n"
@@ -264,15 +277,17 @@ int main(int argc, char **argv)
           "Note: An activated service continues running when its dependents stop.\n"
           "\n"
           "General options:\n"
-          "  -s, --system     : control system daemon instead of user daemon\n"
+          "  --help           : show this help\n"
+          "  -s, --system     : control system daemon (default if run as root)\n"
+          "  -u, --user       : control user daemon\n"
           "  --quiet          : suppress output (except errors)\n"
           "  --socket-path <path>, -p <path>\n"
           "                   : specify socket for communication with daemon\n"
           "\n"
           "Command options:\n"
-          "  --help           : show this help\n"
           "  --no-wait        : don't wait for service startup/shutdown to complete\n"
-          "  --pin            : pin the service in the requested state\n";
+          "  --pin            : pin the service in the requested state\n"
+          "  --force          : force stop even if dependents will be affected\n";
         return 1;
     }
     
@@ -284,7 +299,7 @@ int main(int argc, char **argv)
     }
     else {
         control_socket_path = SYSCONTROLSOCKET; // default to system
-        if (! sys_dinit) {
+        if (user_dinit) {
             char * userhome = getenv("HOME");
             if (userhome == nullptr) {
                 struct passwd * pwuid_p = getpwuid(getuid());
@@ -358,7 +373,7 @@ int main(int argc, char **argv)
                     command == command_t::ENABLE_SERVICE);
         }
         else {
-            return start_stop_service(socknum, rbuffer, service_name, command, do_pin,
+            return start_stop_service(socknum, rbuffer, service_name, command, do_pin, do_force,
                     wait_for_service, verbose);
         }
     }
@@ -433,9 +448,57 @@ static bool load_service(int socknum, cpbuffer_t &rbuffer, const char *name, han
     return true;
 }
 
+// Get the service name for a given handle, by querying the daemon.
+static std::string get_service_name(int socknum, cpbuffer_t &rbuffer, handle_t handle)
+{
+    auto m = membuf()
+            .append((char) DINIT_CP_QUERYSERVICENAME)
+            .append((char) 0)
+            .append(handle);
+    write_all_x(socknum, m);
+
+    wait_for_reply(rbuffer, socknum);
+
+    if (rbuffer[0] != DINIT_RP_SERVICENAME) {
+        throw cp_read_exception{0};
+    }
+
+    // 1 byte reserved
+    // uint16_t size
+    fill_buffer_to(rbuffer, socknum, 2 + sizeof(uint16_t));
+    uint16_t namesize;
+    rbuffer.extract(&namesize, 2, sizeof(uint16_t));
+    rbuffer.consume(2 + sizeof(uint16_t));
+
+    std::string name;
+
+    do {
+        if (rbuffer.get_length() == 0) {
+            rbuffer.fill(socknum);
+        }
+
+        size_t to_extract = std::min(size_t(rbuffer.get_length()), namesize - name.length());
+        size_t contiguous_len = rbuffer.get_contiguous_length(rbuffer.get_ptr(0));
+        if (contiguous_len <= to_extract) {
+            name.append(rbuffer.get_ptr(0), contiguous_len);
+            rbuffer.consume(contiguous_len);
+            name.append(rbuffer.get_ptr(0), to_extract - contiguous_len);
+            rbuffer.consume(to_extract - contiguous_len);
+        }
+        else {
+            name.append(rbuffer.get_ptr(0), to_extract);
+            rbuffer.consume(to_extract);
+            break;
+        }
+
+    } while (name.length() < namesize);
+
+    return name;
+}
+
 // Start/stop a service
 static int start_stop_service(int socknum, cpbuffer_t &rbuffer, const char *service_name,
-        command_t command, bool do_pin, bool wait_for_service, bool verbose)
+        command_t command, bool do_pin, bool do_force, bool wait_for_service, bool verbose)
 {
     using namespace std;
 
@@ -452,6 +515,7 @@ static int start_stop_service(int socknum, cpbuffer_t &rbuffer, const char *serv
     int pcommand = 0;
     switch (command) {
         case command_t::STOP_SERVICE:
+        case command_t::RESTART_SERVICE:  // stop, and then start
             pcommand = DINIT_CP_STOPSERVICE;
             break;
         case command_t::RELEASE_SERVICE:
@@ -470,14 +534,21 @@ static int start_stop_service(int socknum, cpbuffer_t &rbuffer, const char *serv
     // We'll do this regardless of the current service state / target state, since issuing
     // start/stop also sets or clears the "explicitly started" flag on the service.
     {
-        char buf[2 + sizeof(handle)];
-        buf[0] = pcommand;
-        buf[1] = do_pin ? 1 : 0;
-        memcpy(buf + 2, &handle, sizeof(handle));
-        write_all_x(socknum, buf, 2 + sizeof(handle));
-        
+        char flags = (do_pin ? 1 : 0) | ((pcommand == DINIT_CP_STOPSERVICE && !do_force) ? 2 : 0);
+        if (command == command_t::RESTART_SERVICE) {
+            flags |= 4;
+        }
+
+        auto m = membuf()
+                .append((char) pcommand)
+                .append(flags)
+                .append(handle);
+        write_all_x(socknum, m);
+
         wait_for_reply(rbuffer, socknum);
-        if (rbuffer[0] == DINIT_RP_ALREADYSS) {
+        auto reply_pkt_h = rbuffer[0];
+        rbuffer.consume(1); // consume header
+        if (reply_pkt_h == DINIT_RP_ALREADYSS) {
             bool already = (state == wanted_state);
             if (verbose) {
                 cout << "Service " << (already ? "(already) " : "")
@@ -485,11 +556,49 @@ static int start_stop_service(int socknum, cpbuffer_t &rbuffer, const char *serv
             }
             return 0; // success!
         }
-        if (rbuffer[0] != DINIT_RP_ACK) {
-            cerr << "dinitctl: Protocol error." << endl;
+        if (reply_pkt_h == DINIT_RP_DEPENDENTS && pcommand == DINIT_CP_STOPSERVICE) {
+            cerr << "dinitctl: cannot stop service due to the following dependents:\n";
+            if (command != command_t::RESTART_SERVICE) {
+                cerr << "(Only direct dependents are listed. Exercise caution before using '--force' !!)\n";
+            }
+            // size_t number, N * handle_t handles
+            size_t number;
+            rbuffer.fill_to(socknum, sizeof(number));
+            rbuffer.extract(&number, 0, sizeof(number));
+            rbuffer.consume(sizeof(number));
+            std::vector<handle_t> handles;
+            handles.reserve(number);
+            for (size_t i = 0; i < number; i++) {
+                handle_t handle;
+                rbuffer.fill_to(socknum, sizeof(handle_t));
+                rbuffer.extract(&handle, 0, sizeof(handle));
+                handles.push_back(handle);
+                rbuffer.consume(sizeof(handle));
+            }
+            // Print the directly affected dependents:
+            cerr << " ";
+            for (handle_t handle : handles) {
+                cerr << " " << get_service_name(socknum, rbuffer, handle);
+            }
+            cerr << "\n";
             return 1;
         }
-        rbuffer.consume(1);
+        if (reply_pkt_h == DINIT_RP_NAK && command == command_t::RESTART_SERVICE) {
+            cerr << "dinitctl: cannot restart service; service not started.\n";
+            return 1;
+        }
+        if (reply_pkt_h == DINIT_RP_NAK && command == command_t::START_SERVICE) {
+            cerr << "dinitctl: cannot start service (during shut down).\n";
+            return 1;
+        }
+        if (reply_pkt_h == DINIT_RP_NAK && command == command_t::WAKE_SERVICE) {
+            cerr << "dinitctl: service has no active dependents (or system is shutting down), cannot wake.\n";
+            return 1;
+        }
+        if (reply_pkt_h != DINIT_RP_ACK && reply_pkt_h != DINIT_RP_ALREADYSS) {
+            cerr << "dinitctl: protocol error." << endl;
+            return 1;
+        }
     }
 
     if (! wait_for_service) {
@@ -620,10 +729,10 @@ static int unpin_service(int socknum, cpbuffer_t &rbuffer, const char *service_n
     
     // Issue UNPIN command.
     {
-        char buf[1 + sizeof(handle)];
-        buf[0] = DINIT_CP_UNPINSERVICE;
-        memcpy(buf + 1, &handle, sizeof(handle));
-        write_all_x(socknum, buf, 2 + sizeof(handle));
+        auto m = membuf()
+                .append<char>(DINIT_CP_UNPINSERVICE)
+                .append(handle);
+        write_all_x(socknum, m);
         
         wait_for_reply(rbuffer, socknum);
         if (rbuffer[0] != DINIT_RP_ACK) {
@@ -662,10 +771,10 @@ static int unload_service(int socknum, cpbuffer_t &rbuffer, const char *service_
 
     // Issue UNLOAD command.
     {
-        char buf[1 + sizeof(handle)];
-        buf[0] = DINIT_CP_UNLOADSERVICE;
-        memcpy(buf + 1, &handle, sizeof(handle));
-        write_all_x(socknum, buf, 2 + sizeof(handle));
+        auto m = membuf()
+                .append<char>(DINIT_CP_UNLOADSERVICE)
+                .append(handle);
+        write_all_x(socknum, m);
 
         wait_for_reply(rbuffer, socknum);
         if (rbuffer[0] == DINIT_RP_NAK) {
@@ -802,7 +911,6 @@ static int add_remove_dependency(int socknum, cpbuffer_t &rbuffer, bool add,
 {
     using namespace std;
 
-
     handle_t from_handle;
     handle_t to_handle;
 
@@ -811,11 +919,12 @@ static int add_remove_dependency(int socknum, cpbuffer_t &rbuffer, bool add,
         return 1;
     }
 
-    constexpr int pktsize = 2 + sizeof(handle_t) * 2;
-    char cmdbuf[pktsize] = { add ? (char)DINIT_CP_ADD_DEP : (char)DINIT_CP_REM_DEP, (char)dep_type};
-    memcpy(cmdbuf + 2, &from_handle, sizeof(from_handle));
-    memcpy(cmdbuf + 2 + sizeof(from_handle), &to_handle, sizeof(to_handle));
-    write_all_x(socknum, cmdbuf, pktsize);
+    auto m = membuf()
+            .append<char>(add ? (char)DINIT_CP_ADD_DEP : (char)DINIT_CP_REM_DEP)
+            .append(dep_type)
+            .append(from_handle)
+            .append(to_handle);
+    write_all_x(socknum, m);
 
     wait_for_reply(rbuffer, socknum);
 
@@ -837,14 +946,10 @@ static int shutdown_dinit(int socknum, cpbuffer_t &rbuffer)
     // TODO support no-wait option.
     using namespace std;
 
-    // Build buffer;
-    constexpr int bufsize = 2;
-    char buf[bufsize];
-
-    buf[0] = DINIT_CP_SHUTDOWN;
-    buf[1] = static_cast<char>(shutdown_type_t::HALT);
-
-    write_all_x(socknum, buf, bufsize);
+    auto m = membuf()
+            .append<char>(DINIT_CP_SHUTDOWN)
+            .append(static_cast<char>(shutdown_type_t::HALT));
+    write_all_x(socknum, m);
 
     wait_for_reply(rbuffer, socknum);
 

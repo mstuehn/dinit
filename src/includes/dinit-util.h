@@ -21,7 +21,7 @@ inline ssize_t complete_read(int fd, void * buf, size_t n)
             return r;
         }
         if (res < 0) {
-            if (res == EINTR) {
+            if (errno == EINTR) {
                 continue;
             }
 
@@ -73,6 +73,17 @@ inline const char * base_name(const char *path)
         s++;
     }
     return basen;
+}
+
+// Check if one string starts with another
+inline bool starts_with(std::string s, const char *prefix)
+{
+    const char * sp = s.c_str();
+    while (*sp != 0 && *prefix != 0) {
+        if (*sp != *prefix) return false;
+        sp++; prefix++;
+    }
+    return *prefix == 0;
 }
 
 #endif

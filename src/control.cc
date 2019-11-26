@@ -95,6 +95,9 @@ bool control_conn_t::process_packet()
     if (pktType == DINIT_CP_ENABLESERVICE) {
         return add_service_dep(true);
     }
+    if (pktType == DINIT_CP_QUERYSERVICENAME) {
+        return process_query_name();
+    }
 
     // Unrecognized: give error response
     char outbuf[] = { DINIT_RP_BADREQ };
@@ -175,6 +178,39 @@ bool control_conn_t::process_find_load(int pktType)
     return true;
 }
 
+bool control_conn_t::check_dependents(service_record *service, bool &had_dependents)
+{
+    std::vector<char> reply_pkt;
+    size_t num_depts = 0;
+
+    for (service_dep *dep : service->get_dependents()) {
+        if (dep->dep_type == dependency_type::REGULAR && dep->holding_acq) {
+            num_depts++;
+            // find or allocate a service handle
+            handle_t dept_handle = allocate_service_handle(dep->get_from());
+            if (reply_pkt.empty()) {
+                // packet type, size
+                reply_pkt.reserve(1 + sizeof(size_t) + sizeof(handle_t));
+                reply_pkt.resize(1 + sizeof(size_t));
+                reply_pkt[0] = DINIT_RP_DEPENDENTS;
+            }
+            auto old_size = reply_pkt.size();
+            reply_pkt.resize(old_size + sizeof(handle_t));
+            memcpy(reply_pkt.data() + old_size, &dept_handle, sizeof(dept_handle));
+        }
+    }
+
+    if (num_depts != 0) {
+        // There are affected dependents
+        had_dependents = true;
+        memcpy(reply_pkt.data() + 1, &num_depts, sizeof(num_depts));
+        return queue_packet(std::move(reply_pkt));
+    }
+
+    had_dependents = false;
+    return true;
+}
+
 bool control_conn_t::process_start_stop(int pktType)
 {
     using std::string;
@@ -187,10 +223,10 @@ bool control_conn_t::process_start_stop(int pktType)
     }
     
     // 1 byte: packet type
-    // 1 byte: pin in requested state (0 = no pin, 1 = pin)
+    // 1 byte: flags eg. pin in requested state (0 = no pin, 1 = pin)
     // 4 bytes: service handle
     
-    bool do_pin = (rbuf[1] == 1);
+    bool do_pin = ((rbuf[1] & 1) == 1);
     handle_t handle;
     rbuf.extract((char *) &handle, 2, sizeof(handle));
     
@@ -219,24 +255,70 @@ bool control_conn_t::process_start_stop(int pktType)
             if (service->get_state() == service_state_t::STARTED) ack_buf[0] = DINIT_RP_ALREADYSS;
             break;
         case DINIT_CP_STOPSERVICE:
+        {
             // force service to stop
-            if (do_pin) service->pin_stop();
-            service->stop(true);
+            bool do_restart = ((rbuf[1] & 4) == 4);
+            bool gentle = ((rbuf[1] & 2) == 2) || do_restart;  // restart is always "gentle"
+            if (do_restart && services->is_shutting_down()) {
+                ack_buf[0] = DINIT_RP_NAK;
+                break;
+            }
+            if (gentle) {
+                // Check dependents; return appropriate response if any will be affected
+                bool has_dependents;
+                if (! check_dependents(service, has_dependents)) {
+                    return false;
+                }
+                if (has_dependents) {
+                    // Reply packet has already been sent
+                    goto clear_out;
+                }
+            }
+            service_state_t wanted_state;
+            if (do_restart) {
+                if (! service->restart()) {
+                    ack_buf[0] = DINIT_RP_NAK;
+                    break;
+                }
+                wanted_state = service_state_t::STARTED;
+            }
+            else {
+                if (do_pin) service->pin_stop();
+                service->stop(true);
+                wanted_state = service_state_t::STOPPED;
+            }
             service->forced_stop();
             services->process_queues();
-            if (service->get_state() == service_state_t::STOPPED) ack_buf[0] = DINIT_RP_ALREADYSS;
+            if (service->get_state() == wanted_state && !do_restart) ack_buf[0] = DINIT_RP_ALREADYSS;
             break;
+        }
         case DINIT_CP_WAKESERVICE:
-            // re-start a stopped service (do not mark as required)
+        {
+            // re-attach a service to its (started) dependents, causing it to start.
             if (services->is_shutting_down()) {
                 ack_buf[0] = DINIT_RP_NAK;
                 break;
             }
+            bool found_dpt = false;
+            for (auto dpt : service->get_dependents()) {
+                auto from = dpt->get_from();
+                auto from_state = from->get_state();
+                if (from_state == service_state_t::STARTED || from_state == service_state_t::STARTING) {
+                    found_dpt = true;
+                    if (! dpt->holding_acq) {
+                        dpt->get_from()->start_dep(*dpt);
+                    }
+                }
+            }
+            if (! found_dpt) {
+                ack_buf[0] = DINIT_RP_NAK;
+            }
+
             if (do_pin) service->pin_start();
-            service->start(false);
             services->process_queues();
             if (service->get_state() == service_state_t::STARTED) ack_buf[0] = DINIT_RP_ALREADYSS;
             break;
+        }
         case DINIT_CP_RELEASESERVICE:
             // remove required mark, stop if not required by dependents
             if (do_pin) service->pin_stop();
@@ -249,6 +331,7 @@ bool control_conn_t::process_start_stop(int pktType)
         if (! queue_packet(ack_buf, 1)) return false;
     }
     
+    clear_out:
     // Clear the packet from the buffer
     rbuf.consume(pkt_size);
     chklen = 0;
@@ -575,6 +658,46 @@ bool control_conn_t::rm_service_dep()
     return true;
 }
 
+bool control_conn_t::process_query_name()
+{
+    // 1 byte packet type
+    // 1 byte reserved
+    // handle: service
+    constexpr int pkt_size = 2 + sizeof(handle_t);
+
+    if (rbuf.get_length() < pkt_size) {
+        chklen = pkt_size;
+        return true;
+    }
+
+    // Reply:
+    // 1 byte packet type = DINIT_RP_SERVICENAME
+    // 1 byte reserved
+    // uint16_t length
+    // N bytes name
+
+    handle_t handle;
+    rbuf.extract(&handle, 2, sizeof(handle));
+    rbuf.consume(pkt_size);
+    chklen = 0;
+
+    service_record *service = find_service_for_key(handle);
+    if (service == nullptr || service->get_name().length() > std::numeric_limits<uint16_t>::max()) {
+        char ack_rep[] = { DINIT_RP_ACK };
+        if (! queue_packet(ack_rep, 1)) return false;
+    }
+
+    std::vector<char> reply;
+    const std::string &name = service->get_name();
+    uint16_t name_length = name.length();
+    reply.resize(2 + sizeof(uint16_t) + name_length);
+    reply[0] = DINIT_RP_SERVICENAME;
+    memcpy(reply.data() + 2, &name_length, sizeof(name_length));
+    memcpy(reply.data() + 2 + sizeof(uint16_t), name.c_str(), name_length);
+
+    return queue_packet(std::move(reply));
+}
+
 bool control_conn_t::query_load_mech()
 {
     rbuf.consume(1);
@@ -602,23 +725,25 @@ bool control_conn_t::query_load_mech()
         char *wd;
         while (true) {
             std::size_t total_size = curpos + std::size_t(try_path_size);
-            reppkt.resize(total_size);
             if (total_size < curpos) {
-                // overflow.
+                // Overflow. In theory we could now limit to size_t max, but the size must already
+                // be crazy long; let's abort.
                 char ack_rep[] = { DINIT_RP_NAK };
                 if (! queue_packet(ack_rep, 1)) return false;
                 return true;
             }
+            reppkt.resize(total_size);
             wd = getcwd(reppkt.data() + curpos, try_path_size);
             if (wd != nullptr) break;
 
-            try_path_size *= uint32_t(2u);
-            if (try_path_size == 0) {
-                // overflow.
+            // Keep doubling the path size we try until it's big enough, or we get numeric overflow
+            uint32_t new_try_path_size = try_path_size * uint32_t(2u);
+            if (new_try_path_size < try_path_size) {
+                // Overflow.
                 char ack_rep[] = { DINIT_RP_NAK };
-                if (! queue_packet(ack_rep, 1)) return false;
-                return true;
+                return queue_packet(ack_rep, 1);
             }
+            try_path_size = new_try_path_size;
         }
 
         uint32_t wd_len = std::strlen(reppkt.data() + curpos);
@@ -645,8 +770,7 @@ bool control_conn_t::query_load_mech()
     else {
         // If we don't know how to deal with the service set type, send a NAK reply:
         char ack_rep[] = { DINIT_RP_NAK };
-        if (! queue_packet(ack_rep, 1)) return false;
-        return true;
+        return queue_packet(ack_rep, 1);
     }
 }
 

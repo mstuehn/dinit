@@ -1,3 +1,44 @@
+== Version 0.7.0
+
+This release adds a minor feature, and includes a re-work of some base functionality
+(which should not affect most use cases).
+
+ * dinitctl "restart" command added. Re-starts an already-running service without affecting
+   activation or dependency links.
+ * dinitctl "stop" command now requires a `--force` option if dependents of the specified
+   service would also need to stop.
+ * dinitctl "wake" command now reconnects dependency links from dependents of the specified
+   service, and can only be used if at least one such dependent is started.
+
+== Version 0.6.1:
+
+This is a bug-fix release with several minor fixes:
+
+ * Resource limits were not properly being set.
+ * Prevent early termination when standard input is closed or set to a device which cannot
+   be watched for input.
+ * Control protocol fix, possibly not affecting any real usage.
+
+== Version 0.6.0:
+
+This release adds a number of minor features:
+
+ * Better behaviour when boot fails. User can choose an action from reboot, resume boot process,
+   start the "recovery" service, or power-off. 
+ * New service settings for limiting resources at the process level: "rlimit-nofile",
+   "rlimit-core", "rlimit-data", "rlimit-addrspace". Both hard and soft limits can be set.
+   See dinit-service(5) for details.
+ * New "env-file" setting allows per-setting environment to be specified via a file. The file
+   is re-read each time the service process is started. 
+ * Added a "--quiet" option to suppress console output from Dinit.
+ * Dinit when run as a user daemon no longer logs via syslog. Logging to file can still be
+   enabled via the "-l"/"--log-file" option.
+ * Added a "--socket-path"/"-p" option to dinitctl, to specify the socket path for communication
+   with the dinit daemon.
+ 
+A number of minor bugfixes and other improvements are also implemented. An integration test
+framework has been added with a small number of tests, to complement the existing unit tests.
+
 == Version 0.5.2:
 
 This is a bug-fix release for several minor issues which have been found in the preceding

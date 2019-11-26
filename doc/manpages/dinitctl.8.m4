@@ -1,4 +1,5 @@
-.TH DINITCTL "8" "June 2019" "Dinit 0.5.2" "Dinit \- service management system"
+changequote(`@@@',`$$$')dnl
+@@@.TH DINITCTL "8" "$$$MONTH YEAR@@@" "Dinit $$$VERSION@@@" "Dinit \- service management system"
 .SH NAME
 dinitctl \- control services supervised by Dinit
 .\"
@@ -9,6 +10,9 @@ dinitctl \- control services supervised by Dinit
 .br
 .B dinitctl
 [\fIoptions\fR] \fBstop\fR [\fB\-\-no\-wait\fR] [\fB\-\-pin\fR] \fIservice-name\fR
+.br
+.B dinitctl
+[\fIoptions\fR] \fBrestart\fR [\fB\-\-no\-wait\fR] \fIservice-name\fR
 .br
 .B dinitctl
 [\fIoptions\fR] \fBwake\fR [\fB\-\-no\-wait\fR] \fIservice-name\fR
@@ -44,16 +48,23 @@ dinitctl \- control services supervised by Dinit
 .\"
 \fBdinitctl\fR is a utility to control services being managed by the
 \fBdinit\fR daemon. It allows starting and stopping services, and listing
-service status. 
+service status, amongst other actions. It functions by issuing commands to the daemon
+via a control socket.
 .\"
 .SH GENERAL OPTIONS
 .TP
 \fB\-\-help\fR
-display this help and exit
+Display brief help text and then exit.
 .TP
 \fB\-s\fR, \fB\-\-system\fR
-Control the system init process. The default is to control the user process. This option selects
-the path to the control socket used to communicate with the \fBdinit\fR daemon process.
+Control the system init process (this is the default unless run as a non-root user). This option
+determines the default path to the control socket used to communicate with the \fBdinit\fR daemon
+process (it does not override the \fB\-s\fR option).
+.TP
+\fB\-u\fR, \fB\-\-user\fR
+Control the user init process (this is the default when not run as root). This option determines
+the default path to the control socket used to communicate with the \fBdinit\fR daemon process
+(it does not override the \fB\-s\fR option).
 .TP
 \fB\-\-socket\-path\fR \fIsocket-path\fR, \fB\-p\fR \fIsocket-path\fR
 Specify the path to the socket used for communicating with the service manager daemon.
@@ -70,6 +81,9 @@ Do not wait for issued command to complete; exit immediately.
 Pin the service in the requested state. The service will not leave the state until it is unpinned, although
 start/stop commands will be "remembered" while the service is pinned.
 .TP
+\fB\-\-force\fR
+Stop the service even if it will require stopping other services which depend on the specified service.
+.TP
 \fIservice-name\fR
 Specifies the name of the service to which the command applies.
 .TP
@@ -79,24 +93,30 @@ automatically if its dependents stop. If the service is currently stopping it wi
 to stop before it is then restarted.
 .TP
 \fBstop\fR
-Stop the specified service, and remove explicit activation. The service will stop, but may restart
-immediately if any dependents are configured to restart. If the service has dependents only via
-soft dependency links (i.e. \fBwaits-for\fR dependencies) then these links will be broken, so that
-the service will not restart (any other dependencies, however, are retained).
+Stop the specified service, and remove explicit activation. If the service has (non-soft) dependents, an
+error will be displayed unless the \fB\-\-force\fR option is used.
+
+A service with any dependents via soft dependencies will have these dependency links broken when it stops.
 
 The \fBrestart\fR option applied to the stopped service will not by itself cause the service to restart
 when it is stopped via this command. However, a dependent which is configured to restart may
 cause the service itself to restart as a result.
 
 Any pending \fBstart\fR orders are cancelled,
-though a service which is starting might continue its startup before then stopping.
+though a service which is starting will continue its startup before then stopping (unless the service is
+configured to have an interruptible startup or is otherwise at a stage of startup which can be safely
+interrupted).
+.TP
+\fBrestart\fR
+Restart the specified service. The service will be stopped and then restarted, without affecting explicit
+activation status or dependency links from dependents.
 .TP
 \fBwake\fR
-Start the specified service, but do not mark it as explicitly activated if it is not already so
-marked.
+Start the specified service after reattaching dependency links from all active dependents of the specified
+service. The service will not be marked explicitly activated, and so will stop if the dependents stop.
 .TP
 \fBrelease\fR
-Clear the explicit activation mark from a service (service will then stop if it has no active dependents).
+Clear the explicit activation mark from a service (the service will then stop if it has no active dependents).
 .TP
 \fBunpin\fR
 Remove start- and stop- pins from a service. If a started service is not explicitly activated and
@@ -181,3 +201,4 @@ unless pinned.
 .\"
 .SH AUTHOR
 Dinit, and this manual, were written by Davin McCall.
+$$$dnl

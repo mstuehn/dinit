@@ -31,6 +31,7 @@
 #include "dinit-socket.h"
 #include "static-string.h"
 #include "dinit-utmp.h"
+#include "options-processing.h"
 
 #include "mconfig.h"
 
@@ -85,26 +86,8 @@ static const char *env_file_path = SYSENVIRONMENT; //"/etc/dinit/environment";
 static const char *log_path = "/dev/log";
 static bool log_is_syslog = true; // if false, log is a file
 
-static const char *user_home_path = nullptr;
-
 // Set to true (when console_input_watcher is active) if console input becomes available
 static bool console_input_ready = false;
-
-// Get user home (and set user_home_path). (The return may become invalid after
-// changing the evironment (HOME variable) or using the getpwuid() function).
-static const char * get_user_home()
-{
-    if (user_home_path == nullptr) {
-        user_home_path = getenv("HOME");
-        if (user_home_path == nullptr) {
-            struct passwd * pwuid_p = getpwuid(getuid());
-            if (pwuid_p != nullptr) {
-                user_home_path = pwuid_p->pw_dir;
-            }
-        }
-    }
-    return user_home_path;
-}
 
 
 namespace {
@@ -191,18 +174,19 @@ namespace {
     log_flush_timer_t log_flush_timer;
 }
 
+// Main entry point
 int dinit_main(int argc, char **argv)
 {
     using namespace std;
     
     am_pid_one = (getpid() == 1);
     am_system_init = (getuid() == 0);
-    const char * service_dir = nullptr;
-    bool service_dir_dynamic = false; // service_dir dynamically allocated?
     const char * env_file = nullptr;
     bool control_socket_path_set = false;
     bool env_file_set = false;
     bool log_specified = false;
+
+    service_dir_opt service_dir_opts;
 
     // list of services to start
     list<const char *> services_to_start;
@@ -227,7 +211,7 @@ int dinit_main(int argc, char **argv)
                 }
                 else if (strcmp(argv[i], "--services-dir") == 0 || strcmp(argv[i], "-d") == 0) {
                     if (++i < argc) {
-                        service_dir = argv[i];
+                        service_dir_opts.set_specified_service_dir(argv[i]);
                     }
                     else {
                         cerr << "dinit: '--services-dir' (-d) requires an argument" << endl;
@@ -272,7 +256,7 @@ int dinit_main(int argc, char **argv)
                             "                              environment variable initialisation file\n"
                             " --services-dir <dir>, -d <dir>\n"
                             "                              set base directory for service description\n"
-                            "                              files (-d <dir>)\n"
+                            "                              files\n"
                             " --system, -s                 run as the system service manager\n"
                             " --user, -u                   run as a user service manager\n"
                             " --socket-path <path>, -p <path>\n"
@@ -306,10 +290,14 @@ int dinit_main(int argc, char **argv)
     if (am_system_init) {
         // setup STDIN, STDOUT, STDERR so that we can use them
         int onefd = open("/dev/console", O_RDONLY, 0);
-        dup2(onefd, 0);
+        if (onefd != -1) {
+            dup2(onefd, 0);
+        }
         int twofd = open("/dev/console", O_RDWR, 0);
-        dup2(twofd, 1);
-        dup2(twofd, 2);
+        if (twofd != -1) {
+            dup2(twofd, 1);
+            dup2(twofd, 2);
+        }
         
         if (onefd > 2) close(onefd);
         if (twofd > 2) close(twofd);
@@ -339,29 +327,11 @@ int dinit_main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN);
     
     if (! am_system_init && ! control_socket_path_set) {
-        const char * userhome = get_user_home();
+        const char * userhome = service_dir_opt::get_user_home();
         if (userhome != nullptr) {
             control_socket_str = userhome;
             control_socket_str += "/.dinitctl";
             control_socket_path = control_socket_str.c_str();
-        }
-    }
-    
-    /* service directory name */
-    if (service_dir == nullptr && ! am_system_init) {
-        const char * userhome = get_user_home();
-        if (userhome != nullptr) {
-            const char * user_home = get_user_home();
-            size_t user_home_len = strlen(user_home);
-            size_t dinit_d_len = strlen("/dinit.d");
-            size_t full_len = user_home_len + dinit_d_len + 1;
-            char *service_dir_w = new char[full_len];
-            std::memcpy(service_dir_w, user_home, user_home_len);
-            std::memcpy(service_dir_w + user_home_len, "/dinit.d", dinit_d_len);
-            service_dir_w[full_len - 1] = 0;
-
-            service_dir = service_dir_w;
-            service_dir_dynamic = true;
         }
     }
     
@@ -384,12 +354,12 @@ int dinit_main(int argc, char **argv)
 
     sigint_watcher.add_watch(event_loop, SIGINT);
     sigterm_watcher.add_watch(event_loop, SIGTERM);
-    console_input_io.add_watch(event_loop, STDIN_FILENO, dasynq::IN_EVENTS, false);
     
     if (am_pid_one) {
-        // PID 1: SIGQUIT exec's shutdown
+        // PID 1: we may ask for console input; SIGQUIT exec's shutdown
+        console_input_io.add_watch(event_loop, STDIN_FILENO, dasynq::IN_EVENTS, false);
         sigquit_watcher.add_watch(event_loop, SIGQUIT);
-        // As a user process, we instead just let SIGQUIT perform the default action.
+        // (If not PID 1, we instead just let SIGQUIT perform the default action.)
     }
 
     // Try to open control socket (may fail due to readonly filesystem)
@@ -415,22 +385,12 @@ int dinit_main(int argc, char **argv)
     
     log_flush_timer.add_timer(event_loop, dasynq::clock_type::MONOTONIC);
 
-    bool add_all_service_dirs = false;
-    if (service_dir == nullptr) {
-        service_dir = SYSSERVICEDIR; //"/etc/dinit.d";
-        add_all_service_dirs = true;
-    }
-
     /* start requested services */
-    services = new dirload_service_set(service_dir, service_dir_dynamic);
-    if (add_all_service_dirs) {
-        services->add_service_dir("/usr/local/lib/dinit.d", false);
-        services->add_service_dir("/lib/dinit.d", false);
-    }
-    
+    services = new dirload_service_set(std::move(service_dir_opts.get_paths()));
+
     init_log(services, log_is_syslog);
     if (am_system_init) {
-        log(loglevel_t::INFO, false, "starting system");
+        log(loglevel_t::INFO, false, "Starting system");
     }
     
     // Only try to set up the external log now if we aren't the system init. (If we are the

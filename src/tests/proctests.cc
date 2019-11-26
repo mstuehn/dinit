@@ -29,8 +29,11 @@ class base_process_service_test
 
     static void exec_failed(base_process_service *bsp, int errcode)
     {
+        run_proc_err err;
+        err.stage = exec_stage::DO_EXEC;
+        err.st_errno = errcode;
     	bsp->waiting_for_execstat = false;
-    	bsp->exec_failed(errcode);
+    	bsp->exec_failed(err);
     }
 
     static void handle_exit(base_process_service *bsp, int exit_status)
@@ -162,7 +165,6 @@ void test_proc_unexpected_term()
     assert(p.get_state() == service_state_t::STARTED);
 
     base_process_service_test::handle_exit(&p, 0);
-    sset.process_queues();
 
     assert(p.get_state() == service_state_t::STOPPED);
     assert(p.get_stop_reason() == stopped_reason_t::TERMINATED);
@@ -972,6 +974,7 @@ void test_waitsfor_restart()
     assert(tp.get_state() == service_state_t::STARTING);
     assert(p.get_state() == service_state_t::STOPPING);
 
+    // p terminates (finishes stopping). Then it should re-start...
     base_process_service_test::handle_signal_exit(&p, SIGTERM);
     sset.process_queues();
 

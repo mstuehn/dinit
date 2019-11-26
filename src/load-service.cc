@@ -22,266 +22,6 @@
 using string = std::string;
 using string_iterator = std::string::iterator;
 
-// Convert a signal name to the corresponding signal number
-static int signal_name_to_number(std::string &signame)
-{
-    if (signame == "HUP") return SIGHUP;
-    if (signame == "INT") return SIGINT;
-    if (signame == "QUIT") return SIGQUIT;
-    if (signame == "USR1") return SIGUSR1;
-    if (signame == "USR2") return SIGUSR2;
-    if (signame == "KILL") return SIGKILL;
-    return -1;
-}
-
-static const char * uid_err_msg = "Specified user id contains invalid numeric characters "
-        "or is outside allowed range.";
-
-// Parse a userid parameter which may be a numeric user ID or a username. If a name, the
-// userid is looked up via the system user database (getpwnam() function). In this case,
-// the associated group is stored in the location specified by the group_p parameter iff
-// it is not null and iff it contains the value -1.
-static uid_t parse_uid_param(const std::string &param, const std::string &service_name, gid_t *group_p)
-{
-    // Could be a name or a numeric id. But we should assume numeric first, just in case
-    // a user manages to give themselves a username that parses as a number.
-    std::size_t ind = 0;
-    try {
-        // POSIX does not specify whether uid_t is an signed or unsigned, but regardless
-        // is is probably safe to assume that valid values are positive. We'll also assert
-        // that the value range fits within "unsigned long long" since it seems unlikely
-        // that would ever not be the case.
-        static_assert((uintmax_t)std::numeric_limits<uid_t>::max()
-                <= (uintmax_t)std::numeric_limits<unsigned long long>::max(), "uid_t is too large");
-        unsigned long long v = std::stoull(param, &ind, 0);
-        if (v > static_cast<unsigned long long>(std::numeric_limits<uid_t>::max())
-                || ind != param.length()) {
-            throw service_description_exc(service_name, uid_err_msg);
-        }
-        return v;
-    }
-    catch (std::out_of_range &exc) {
-        throw service_description_exc(service_name, uid_err_msg);
-    }
-    catch (std::invalid_argument &exc) {
-        // Ok, so it doesn't look like a number: proceed...
-    }
-
-    errno = 0;
-    struct passwd * pwent = getpwnam(param.c_str());
-    if (pwent == nullptr) {
-        // Maybe an error, maybe just no entry.
-        if (errno == 0) {
-            throw service_description_exc(service_name, "Specified user \"" + param
-                    + "\" does not exist in system database.");
-        }
-        else {
-            throw service_description_exc(service_name, std::string("Error accessing user database: ")
-                    + strerror(errno));
-        }
-    }
-    
-    if (group_p && *group_p != (gid_t)-1) {
-        *group_p = pwent->pw_gid;
-    }
-    
-    return pwent->pw_uid;
-}
-
-static const char * num_err_msg = "Specified value contains invalid numeric characters or is outside "
-        "allowed range.";
-
-// Parse an unsigned numeric parameter value
-static unsigned long long parse_unum_param(const std::string &param, const std::string &service_name,
-        unsigned long long max = std::numeric_limits<unsigned long long>::max())
-{
-    std::size_t ind = 0;
-    try {
-        unsigned long long v = std::stoull(param, &ind, 0);
-        if (v > max || ind != param.length()) {
-            throw service_description_exc(service_name, num_err_msg);
-        }
-        return v;
-    }
-    catch (std::out_of_range &exc) {
-        throw service_description_exc(service_name, num_err_msg);
-    }
-    catch (std::invalid_argument &exc) {
-        throw service_description_exc(service_name, num_err_msg);
-    }
-}
-
-static const char * gid_err_msg = "Specified group id contains invalid numeric characters or is "
-        "outside allowed range.";
-
-static gid_t parse_gid_param(const std::string &param, const std::string &service_name)
-{
-    // Could be a name or a numeric id. But we should assume numeric first, just in case
-    // a user manages to give themselves a username that parses as a number.
-    std::size_t ind = 0;
-    try {
-        // POSIX does not specify whether uid_t is an signed or unsigned, but regardless
-        // is is probably safe to assume that valid values are positive. We'll also assume
-        // that the value range fits with "unsigned long long" since it seems unlikely
-        // that would ever not be the case.
-        static_assert((uintmax_t)std::numeric_limits<gid_t>::max()
-                <= (uintmax_t)std::numeric_limits<unsigned long long>::max(), "gid_t is too large");
-        unsigned long long v = std::stoull(param, &ind, 0);
-        if (v > static_cast<unsigned long long>(std::numeric_limits<gid_t>::max())
-                || ind != param.length()) {
-            throw service_description_exc(service_name, gid_err_msg);
-        }
-        return v;
-    }
-    catch (std::out_of_range &exc) {
-        throw service_description_exc(service_name, gid_err_msg);
-    }
-    catch (std::invalid_argument &exc) {
-        // Ok, so it doesn't look like a number: proceed...
-    }
-
-    errno = 0;
-    struct group * grent = getgrnam(param.c_str());
-    if (grent == nullptr) {
-        // Maybe an error, maybe just no entry.
-        if (errno == 0) {
-            throw service_description_exc(service_name, "Specified group \"" + param
-                    + "\" does not exist in system database.");
-        }
-        else {
-            throw service_description_exc(service_name, std::string("Error accessing group database: ")
-                    + strerror(errno));
-        }
-    }
-    
-    return grent->gr_gid;
-}
-
-// Parse a time, specified as a decimal number of seconds (with optional fractional component after decimal
-// point or decimal comma).
-static void parse_timespec(const std::string &paramval, const std::string &servicename,
-        const char * paramname, timespec &ts)
-{
-    decltype(ts.tv_sec) isec = 0;
-    decltype(ts.tv_nsec) insec = 0;
-    auto max_secs = std::numeric_limits<decltype(isec)>::max() / 10;
-    auto len = paramval.length();
-    decltype(len) i;
-    for (i = 0; i < len; i++) {
-        char ch = paramval[i];
-        if (ch == '.' || ch == ',') {
-            i++;
-            break;
-        }
-        if (ch < '0' || ch > '9') {
-            throw service_description_exc(servicename, std::string("Bad value for ") + paramname);
-        }
-        // check for overflow
-        if (isec >= max_secs) {
-           throw service_description_exc(servicename, std::string("Too-large value for ") + paramname);
-        }
-        isec *= 10;
-        isec += ch - '0';
-    }
-    decltype(insec) insec_m = 100000000; // 10^8
-    for ( ; i < len; i++) {
-        char ch = paramval[i];
-        if (ch < '0' || ch > '9') {
-            throw service_description_exc(servicename, std::string("Bad value for ") + paramname);
-        }
-        insec += (ch - '0') * insec_m;
-        insec_m /= 10;
-    }
-    ts.tv_sec = isec;
-    ts.tv_nsec = insec;
-}
-
-// In a vector, find or create rlimits for a particular resource type.
-static service_rlimits &find_rlimits(std::vector<service_rlimits> all_rlimits, int resource_id)
-{
-    for (service_rlimits &limits : all_rlimits) {
-        if (limits.resource_id == resource_id) {
-            return limits;
-        }
-    }
-
-    all_rlimits.emplace_back(resource_id);
-    return all_rlimits.back();
-}
-
-// Parse resource limits setting (can specify both hard and soft limit).
-static void parse_rlimit(const std::string &line, const std::string &service_name, const char *param_name,
-        service_rlimits &rlimit)
-{
-    // Examples:
-    // 4:5 - soft:hard limits both set
-    // 4:-   soft set, hard set to unlimited
-    // 4:    soft set, hard limit unchanged
-    // 4     soft and hard limit set to same limit
-
-    if (line.empty()) {
-        throw service_description_exc(service_name, std::string("Bad value for ") + param_name);
-    }
-
-    const char *cline = line.c_str();
-    rlimit.hard_set = rlimit.soft_set = false;
-
-    try {
-        const char * index = cline;
-        errno = 0;
-        if (cline[0] != ':') {
-            rlimit.soft_set = true;
-            if (cline[0] == '-') {
-                rlimit.limits.rlim_cur = RLIM_INFINITY;
-                index = cline + 1;
-            }
-            else {
-                char *nindex;
-                unsigned long long limit = std::strtoull(cline, &nindex, 0);
-                index = nindex;
-                if (errno == ERANGE || limit > std::numeric_limits<rlim_t>::max()) throw std::out_of_range("");
-                if (index == cline) throw std::invalid_argument("");
-                rlimit.limits.rlim_cur = limit;
-            }
-
-            if (*index == 0) {
-                rlimit.hard_set = true;
-                rlimit.limits.rlim_max = rlimit.limits.rlim_cur;
-                return;
-            }
-
-            if (*index != ':') {
-                throw service_description_exc(service_name, std::string("Bad value for ") + param_name);
-            }
-        }
-
-        index++;
-        if (*index == 0) return;
-
-        if (*index == '-') {
-            rlimit.limits.rlim_max = RLIM_INFINITY;
-            if (index[1] != 0) {
-                throw service_description_exc(service_name, std::string("Bad value for ") + param_name);
-            }
-        }
-        else {
-            const char *hard_start = index;
-            char *nindex;
-            unsigned long long limit = std::strtoull(cline, &nindex, 0);
-            index = nindex;
-            if (errno == ERANGE || limit > std::numeric_limits<rlim_t>::max()) throw std::out_of_range("");
-            if (index == hard_start) throw std::invalid_argument("");
-            rlimit.limits.rlim_max = limit;
-        }
-    }
-    catch (std::invalid_argument &exc) {
-        throw service_description_exc(service_name, std::string("Bad value for ") + param_name);
-    }
-    catch (std::out_of_range &exc) {
-        throw service_description_exc(service_name, std::string("Too-large value for ") + param_name);
-    }
-}
-
 // Perform environment variable substitution on a command line, if specified.
 //   line -  the string storing the command and arguments
 //   offsets - the [start,end) pair of offsets of the command and each argument within the string
@@ -368,23 +108,13 @@ static void process_dep_dir(dirload_service_set &sset,
         log(loglevel_t::WARN, "Error reading dependency directory '", depdirpath,
                 "' for ", servicename, " service.");
     }
+
+    closedir(depdir);
 }
 
-// Check if one string starts with another
-static bool starts_with(string s, const char *prefix)
-{
-    const char * sp = s.c_str();
-    while (*sp != 0 && *prefix != 0) {
-        if (*sp != *prefix) return false;
-        sp++; prefix++;
-    }
-    return *prefix == 0;
-}
-
-// Find a service record, or load it from file. If the service has
-// dependencies, load those also.
+// Find a service record, or load it from file. If the service has dependencies, load those also.
 //
-// Might throw a ServiceLoadExc exception if a dependency cycle is found or if another
+// Throws service_load_exc (or subclass) if a dependency cycle is found or if another
 // problem occurs (I/O error, service description not found etc). Throws std::bad_alloc
 // if a memory allocation failure occurs.
 //
@@ -430,52 +160,12 @@ service_record * dirload_service_set::load_service(const char * name)
         throw service_not_found(string(name));
     }
 
-    string command;
-    list<pair<unsigned,unsigned>> command_offsets;
-    string stop_command;
-    list<pair<unsigned,unsigned>> stop_command_offsets;
-    string working_dir;
-    string pid_file;
-    string env_file;
-
-    bool do_sub_vars = false;
-
-    service_type_t service_type = service_type_t::PROCESS;
-    std::list<prelim_dep> depends;
-    string logfile;
-    service_flags_t onstart_flags;
-    int term_signal = -1;  // additional termination signal
-    bool auto_restart = false;
-    bool smooth_recovery = false;
-    string socket_path;
-    int socket_perms = 0666;
-    // Note: Posix allows that uid_t and gid_t may be unsigned types, but eg chown uses -1 as an
-    // invalid value, so it's safe to assume that we can do the same:
-    uid_t socket_uid = -1;
-    gid_t socket_gid = -1;
-    // Restart limit interval / count; default is 10 seconds, 3 restarts:
-    timespec restart_interval = { .tv_sec = 10, .tv_nsec = 0 };
-    int max_restarts = 3;
-    timespec restart_delay = { .tv_sec = 0, .tv_nsec = 200000000 };
-    timespec stop_timeout = { .tv_sec = 10, .tv_nsec = 0 };
-    timespec start_timeout = { .tv_sec = 60, .tv_nsec = 0 };
-    std::vector<service_rlimits> rlimits;
-    
-    int readiness_fd = -1;      // readiness fd in service process
-    std::string readiness_var;  // environment var to hold readiness fd
-
-    uid_t run_as_uid = -1;
-    gid_t run_as_gid = -1;
-
-    string chain_to_name;
-
-    #if USE_UTMPX
-    char inittab_id[sizeof(utmpx().ut_id)] = {0};
-    char inittab_line[sizeof(utmpx().ut_line)] = {0};
-    #endif
+    service_settings_wrapper<prelim_dep> settings;
 
     string line;
-    service_file.exceptions(ios::badbit | ios::failbit);
+    // getline can set failbit if it reaches end-of-file, we don't want an exception in that case. There's
+    // no good way to handle an I/O error however, so we'll have exceptions thrown on badbit:
+    service_file.exceptions(ios::badbit);
     
     // Add a dummy service record now to prevent infinite recursion in case of cyclic dependency.
     // We replace this with the real service later (or remove it if we find a configuration error).
@@ -483,270 +173,28 @@ service_record * dirload_service_set::load_service(const char * name)
     add_service(rval);
     
     try {
-        // getline can set failbit if it reaches end-of-file, we don't want an exception in that case:
-        service_file.exceptions(ios::badbit);
-        
         process_service_file(name, service_file,
                 [&](string &line, string &setting, string_iterator &i, string_iterator &end) -> void {
-            if (setting == "command") {
-                command = read_setting_value(i, end, &command_offsets);
-            }
-            else if (setting == "working-dir") {
-                working_dir = read_setting_value(i, end, nullptr);
-            }
-            else if (setting == "env-file") {
-                env_file = read_setting_value(i, end, nullptr);
-            }
-            else if (setting == "socket-listen") {
-                socket_path = read_setting_value(i, end, nullptr);
-            }
-            else if (setting == "socket-permissions") {
-                string sock_perm_str = read_setting_value(i, end, nullptr);
-                std::size_t ind = 0;
-                try {
-                    socket_perms = std::stoi(sock_perm_str, &ind, 8);
-                    if (ind != sock_perm_str.length()) {
-                        throw std::logic_error("");
-                    }
-                }
-                catch (std::logic_error &exc) {
-                    throw service_description_exc(name, "socket-permissions: Badly-formed or "
-                            "out-of-range numeric value");
-                }
-            }
-            else if (setting == "socket-uid") {
-                string sock_uid_s = read_setting_value(i, end, nullptr);
-                socket_uid = parse_uid_param(sock_uid_s, name, &socket_gid);
-            }
-            else if (setting == "socket-gid") {
-                string sock_gid_s = read_setting_value(i, end, nullptr);
-                socket_gid = parse_gid_param(sock_gid_s, name);
-            }
-            else if (setting == "stop-command") {
-                stop_command = read_setting_value(i, end, &stop_command_offsets);
-            }
-            else if (setting == "pid-file") {
-                pid_file = read_setting_value(i, end);
-            }
-            else if (setting == "depends-on") {
-                string dependency_name = read_setting_value(i, end);
-                depends.emplace_back(load_service(dependency_name.c_str()), dependency_type::REGULAR);
-            }
-            else if (setting == "depends-ms") {
-                string dependency_name = read_setting_value(i, end);
-                depends.emplace_back(load_service(dependency_name.c_str()), dependency_type::MILESTONE);
-            }
-            else if (setting == "waits-for") {
-                string dependency_name = read_setting_value(i, end);
-                depends.emplace_back(load_service(dependency_name.c_str()), dependency_type::WAITS_FOR);
-            }
-            else if (setting == "waits-for.d") {
-                string waitsford = read_setting_value(i, end);
-                process_dep_dir(*this, name, service_filename, depends, waitsford,
-                        dependency_type::WAITS_FOR);
-            }
-            else if (setting == "logfile") {
-                logfile = read_setting_value(i, end);
-            }
-            else if (setting == "restart") {
-                string restart = read_setting_value(i, end);
-                auto_restart = (restart == "yes" || restart == "true");
-            }
-            else if (setting == "smooth-recovery") {
-                string recovery = read_setting_value(i, end);
-                smooth_recovery = (recovery == "yes" || recovery == "true");
-            }
-            else if (setting == "type") {
-                string type_str = read_setting_value(i, end);
-                if (type_str == "scripted") {
-                    service_type = service_type_t::SCRIPTED;
-                }
-                else if (type_str == "process") {
-                    service_type = service_type_t::PROCESS;
-                }
-                else if (type_str == "bgprocess") {
-                    service_type = service_type_t::BGPROCESS;
-                }
-                else if (type_str == "internal") {
-                    service_type = service_type_t::INTERNAL;
-                }
-                else {
-                    throw service_description_exc(name, "Service type must be one of: \"scripted\","
-                        " \"process\", \"bgprocess\" or \"internal\"");
-                }
-            }
-            else if (setting == "options") {
-                std::list<std::pair<unsigned,unsigned>> indices;
-                string onstart_cmds = read_setting_value(i, end, &indices);
-                for (auto indexpair : indices) {
-                    string option_txt = onstart_cmds.substr(indexpair.first,
-                            indexpair.second - indexpair.first);
-                    if (option_txt == "starts-rwfs") {
-                        onstart_flags.rw_ready = true;
-                    }
-                    else if (option_txt == "starts-log") {
-                        onstart_flags.log_ready = true;
-                    }
-                    else if (option_txt == "no-sigterm") {
-                        onstart_flags.no_sigterm = true;
-                    }
-                    else if (option_txt == "runs-on-console") {
-                        onstart_flags.runs_on_console = true;
-                        // A service that runs on the console necessarily starts on console:
-                        onstart_flags.starts_on_console = true;
-                        onstart_flags.shares_console = false;
-                    }
-                    else if (option_txt == "starts-on-console") {
-                        onstart_flags.starts_on_console = true;
-                        onstart_flags.shares_console = false;
-                    }
-                    else if (option_txt == "shares-console") {
-                        onstart_flags.shares_console = true;
-                        onstart_flags.runs_on_console = false;
-                        onstart_flags.starts_on_console = false;
-                    }
-                    else if (option_txt == "pass-cs-fd") {
-                        onstart_flags.pass_cs_fd = true;
-                    }
-                    else if (option_txt == "start-interruptible") {
-                        onstart_flags.start_interruptible = true;
-                    }
-                    else if (option_txt == "skippable") {
-                        onstart_flags.skippable = true;
-                    }
-                    else if (option_txt == "signal-process-only") {
-                        onstart_flags.signal_process_only = true;
-                    }
-                    else {
-                        throw service_description_exc(name, "Unknown option: " + option_txt);
-                    }
-                }
-            }
-            else if (setting == "load-options") {
-                std::list<std::pair<unsigned,unsigned>> indices;
-                string load_opts = read_setting_value(i, end, &indices);
-                for (auto indexpair : indices) {
-                    string option_txt = load_opts.substr(indexpair.first,
-                            indexpair.second - indexpair.first);
-                    if (option_txt == "sub-vars") {
-                        // substitute environment variables in command line
-                        do_sub_vars = true;
-                    }
-                    else if (option_txt == "no-sub-vars") {
-                        do_sub_vars = false;
-                    }
-                    else {
-                        throw service_description_exc(name, "Unknown load option: " + option_txt);
-                    }
-                }
-            }
-            else if (setting == "term-signal" || setting == "termsignal") {
-                // Note: "termsignal" supported for legacy reasons.
-                string signame = read_setting_value(i, end, nullptr);
-                int signo = signal_name_to_number(signame);
-                if (signo == -1) {
-                    throw service_description_exc(name, "Unknown/unsupported termination signal: "
-                            + signame);
-                }
-                else {
-                    term_signal = signo;
-                }
-            }
-            else if (setting == "restart-limit-interval") {
-                string interval_str = read_setting_value(i, end, nullptr);
-                parse_timespec(interval_str, name, "restart-limit-interval", restart_interval);
-            }
-            else if (setting == "restart-delay") {
-                string rsdelay_str = read_setting_value(i, end, nullptr);
-                parse_timespec(rsdelay_str, name, "restart-delay", restart_delay);
-            }
-            else if (setting == "restart-limit-count") {
-                string limit_str = read_setting_value(i, end, nullptr);
-                max_restarts = parse_unum_param(limit_str, name, std::numeric_limits<int>::max());
-            }
-            else if (setting == "stop-timeout") {
-                string stoptimeout_str = read_setting_value(i, end, nullptr);
-                parse_timespec(stoptimeout_str, name, "stop-timeout", stop_timeout);
-            }
-            else if (setting == "start-timeout") {
-                string starttimeout_str = read_setting_value(i, end, nullptr);
-                parse_timespec(starttimeout_str, name, "start-timeout", start_timeout);
-            }
-            else if (setting == "run-as") {
-                string run_as_str = read_setting_value(i, end, nullptr);
-                run_as_uid = parse_uid_param(run_as_str, name, &run_as_gid);
-            }
-            else if (setting == "chain-to") {
-                chain_to_name = read_setting_value(i, end, nullptr);
-            }
-            else if (setting == "ready-notification") {
-                string notify_setting = read_setting_value(i, end, nullptr);
-                if (starts_with(notify_setting, "pipefd:")) {
-                    readiness_fd = parse_unum_param(notify_setting.substr(7 /* len 'pipefd:' */),
-                            name, std::numeric_limits<int>::max());
-                }
-                else if (starts_with(notify_setting, "pipevar:")) {
-                    readiness_var = notify_setting.substr(8 /* len 'pipevar:' */);
-                    if (readiness_var.empty()) {
-                        throw service_description_exc(name, "Invalid pipevar variable name "
-                                "in ready-notification");
-                    }
-                }
-                else {
-                    throw service_description_exc(name, "Unknown ready-notification setting: "
-                            + notify_setting);
-                }
-            }
-            else if (setting == "inittab-id") {
-                string inittab_setting = read_setting_value(i, end, nullptr);
-                #if USE_UTMPX
-                if (inittab_setting.length() > sizeof(inittab_id)) {
-                    throw service_description_exc(name, "inittab-id setting is too long");
-                }
-                strncpy(inittab_id, inittab_setting.c_str(), sizeof(inittab_id));
-                #endif
-            }
-            else if (setting == "inittab-line") {
-                string inittab_setting = read_setting_value(i, end, nullptr);
-                #if USE_UTMPX
-                if (inittab_setting.length() > sizeof(inittab_line)) {
-                    throw service_description_exc(name, "inittab-line setting is too long");
-                }
-                strncpy(inittab_line, inittab_setting.c_str(), sizeof(inittab_line));
-                #endif
-            }
-            else if (setting == "rlimit-nofile") {
-                string nofile_setting = read_setting_value(i, end, nullptr);
-                service_rlimits &nofile_limits = find_rlimits(rlimits, RLIMIT_NOFILE);
-                parse_rlimit(line, name, "rlimit-nofile", nofile_limits);
-            }
-            else if (setting == "rlimit-core") {
-                string nofile_setting = read_setting_value(i, end, nullptr);
-                service_rlimits &nofile_limits = find_rlimits(rlimits, RLIMIT_CORE);
-                parse_rlimit(line, name, "rlimit-core", nofile_limits);
-            }
-            else if (setting == "rlimit-data") {
-                string nofile_setting = read_setting_value(i, end, nullptr);
-                service_rlimits &nofile_limits = find_rlimits(rlimits, RLIMIT_DATA);
-                parse_rlimit(line, name, "rlimit-data", nofile_limits);
-            }
-            else if (setting == "rlimit-addrspace") {
-                #if defined(RLIMIT_AS)
-                    string nofile_setting = read_setting_value(i, end, nullptr);
-                    service_rlimits &nofile_limits = find_rlimits(rlimits, RLIMIT_AS);
-                    parse_rlimit(line, name, "rlimit-addrspace", nofile_limits);
-                #endif
-            }
-            else {
-                throw service_description_exc(name, "Unknown setting: " + setting);
-            }
+
+            auto process_dep_dir_n = [&](std::list<prelim_dep> &deplist, const std::string &waitsford,
+                    dependency_type dep_type) -> void {
+                process_dep_dir(*this, name, service_filename, deplist, waitsford, dep_type);
+            };
+
+            auto load_service_n = [&](const string &dep_name) -> service_record * {
+                return load_service(dep_name.c_str());
+            };
+
+            process_service_line(settings, name, line, setting, i, end, load_service_n, process_dep_dir_n);
         });
 
         service_file.close();
         
+        auto service_type = settings.service_type;
+
         if (service_type == service_type_t::PROCESS || service_type == service_type_t::BGPROCESS
                 || service_type == service_type_t::SCRIPTED) {
-            if (command.length() == 0) {
+            if (settings.command.length() == 0) {
                 throw service_description_exc(name, "Service command not specified");
             }
         }
@@ -757,66 +205,67 @@ service_record * dirload_service_set::load_service(const char * name)
                 // We've found the dummy record
                 delete rval;
                 if (service_type == service_type_t::PROCESS) {
-                    do_env_subst(command, command_offsets, do_sub_vars);
-                    auto rvalps = new process_service(this, string(name), std::move(command),
-                            command_offsets, depends);
-                    rvalps->set_working_dir(working_dir);
-                    rvalps->set_env_file(env_file);
-                    rvalps->set_rlimits(std::move(rlimits));
-                    rvalps->set_restart_interval(restart_interval, max_restarts);
-                    rvalps->set_restart_delay(restart_delay);
-                    rvalps->set_stop_timeout(stop_timeout);
-                    rvalps->set_start_timeout(start_timeout);
-                    rvalps->set_extra_termination_signal(term_signal);
-                    rvalps->set_run_as_uid_gid(run_as_uid, run_as_gid);
-                    rvalps->set_notification_fd(readiness_fd);
-                    rvalps->set_notification_var(std::move(readiness_var));
+                    do_env_subst(settings.command, settings.command_offsets, settings.do_sub_vars);
+                    auto rvalps = new process_service(this, string(name), std::move(settings.command),
+                            settings.command_offsets, settings.depends);
+                    rvalps->set_working_dir(settings.working_dir);
+                    rvalps->set_env_file(settings.env_file);
+                    rvalps->set_rlimits(std::move(settings.rlimits));
+                    rvalps->set_restart_interval(settings.restart_interval, settings.max_restarts);
+                    rvalps->set_restart_delay(settings.restart_delay);
+                    rvalps->set_stop_timeout(settings.stop_timeout);
+                    rvalps->set_start_timeout(settings.start_timeout);
+                    rvalps->set_extra_termination_signal(settings.term_signal);
+                    rvalps->set_run_as_uid_gid(settings.run_as_uid, settings.run_as_gid);
+                    rvalps->set_notification_fd(settings.readiness_fd);
+                    rvalps->set_notification_var(std::move(settings.readiness_var));
                     #if USE_UTMPX
-                    rvalps->set_utmp_id(inittab_id);
-                    rvalps->set_utmp_line(inittab_line);
+                    rvalps->set_utmp_id(settings.inittab_id);
+                    rvalps->set_utmp_line(settings.inittab_line);
                     #endif
                     rval = rvalps;
                 }
                 else if (service_type == service_type_t::BGPROCESS) {
-                    do_env_subst(command, command_offsets, do_sub_vars);
-                    auto rvalps = new bgproc_service(this, string(name), std::move(command),
-                            command_offsets, depends);
-                    rvalps->set_working_dir(working_dir);
-                    rvalps->set_env_file(env_file);
-                    rvalps->set_rlimits(std::move(rlimits));
-                    rvalps->set_pid_file(std::move(pid_file));
-                    rvalps->set_restart_interval(restart_interval, max_restarts);
-                    rvalps->set_restart_delay(restart_delay);
-                    rvalps->set_stop_timeout(stop_timeout);
-                    rvalps->set_start_timeout(start_timeout);
-                    rvalps->set_extra_termination_signal(term_signal);
-                    rvalps->set_run_as_uid_gid(run_as_uid, run_as_gid);
-                    onstart_flags.runs_on_console = false;
+                    do_env_subst(settings.command, settings.command_offsets, settings.do_sub_vars);
+                    auto rvalps = new bgproc_service(this, string(name), std::move(settings.command),
+                            settings.command_offsets, settings.depends);
+                    rvalps->set_working_dir(settings.working_dir);
+                    rvalps->set_env_file(settings.env_file);
+                    rvalps->set_rlimits(std::move(settings.rlimits));
+                    rvalps->set_pid_file(std::move(settings.pid_file));
+                    rvalps->set_restart_interval(settings.restart_interval, settings.max_restarts);
+                    rvalps->set_restart_delay(settings.restart_delay);
+                    rvalps->set_stop_timeout(settings.stop_timeout);
+                    rvalps->set_start_timeout(settings.start_timeout);
+                    rvalps->set_extra_termination_signal(settings.term_signal);
+                    rvalps->set_run_as_uid_gid(settings.run_as_uid, settings.run_as_gid);
+                    settings.onstart_flags.runs_on_console = false;
                     rval = rvalps;
                 }
                 else if (service_type == service_type_t::SCRIPTED) {
-                    do_env_subst(command, command_offsets, do_sub_vars);
-                    auto rvalps = new scripted_service(this, string(name), std::move(command),
-                            command_offsets, depends);
-                    rvalps->set_stop_command(stop_command, stop_command_offsets);
-                    rvalps->set_working_dir(working_dir);
-                    rvalps->set_env_file(env_file);
-                    rvalps->set_rlimits(std::move(rlimits));
-                    rvalps->set_stop_timeout(stop_timeout);
-                    rvalps->set_start_timeout(start_timeout);
-                    rvalps->set_extra_termination_signal(term_signal);
-                    rvalps->set_run_as_uid_gid(run_as_uid, run_as_gid);
+                    do_env_subst(settings.command, settings.command_offsets, settings.do_sub_vars);
+                    auto rvalps = new scripted_service(this, string(name), std::move(settings.command),
+                            settings.command_offsets, settings.depends);
+                    rvalps->set_stop_command(settings.stop_command, settings.stop_command_offsets);
+                    rvalps->set_working_dir(settings.working_dir);
+                    rvalps->set_env_file(settings.env_file);
+                    rvalps->set_rlimits(std::move(settings.rlimits));
+                    rvalps->set_stop_timeout(settings.stop_timeout);
+                    rvalps->set_start_timeout(settings.start_timeout);
+                    rvalps->set_extra_termination_signal(settings.term_signal);
+                    rvalps->set_run_as_uid_gid(settings.run_as_uid, settings.run_as_gid);
                     rval = rvalps;
                 }
                 else {
-                    rval = new service_record(this, string(name), service_type, depends);
+                    rval = new service_record(this, string(name), service_type, settings.depends);
                 }
-                rval->set_log_file(logfile);
-                rval->set_auto_restart(auto_restart);
-                rval->set_smooth_recovery(smooth_recovery);
-                rval->set_flags(onstart_flags);
-                rval->set_socket_details(std::move(socket_path), socket_perms, socket_uid, socket_gid);
-                rval->set_chain_to(std::move(chain_to_name));
+                rval->set_log_file(settings.logfile);
+                rval->set_auto_restart(settings.auto_restart);
+                rval->set_smooth_recovery(settings.smooth_recovery);
+                rval->set_flags(settings.onstart_flags);
+                rval->set_socket_details(std::move(settings.socket_path), settings.socket_perms,
+                        settings.socket_uid, settings.socket_gid);
+                rval->set_chain_to(std::move(settings.chain_to_name));
                 *iter = rval;
                 break;
             }
@@ -831,8 +280,14 @@ service_record * dirload_service_set::load_service(const char * name)
         delete rval;
         throw service_description_exc(name, std::move(setting_exc.get_info()));
     }
-    catch (...) {
-        // Must remove the dummy service record.
+    catch (std::system_error &sys_err)
+    {
+        records.erase(std::find(records.begin(), records.end(), rval));
+        delete rval;
+        throw service_description_exc(name, sys_err.what());
+    }
+    catch (...) // (should only be std::bad_alloc)
+    {
         records.erase(std::find(records.begin(), records.end(), rval));
         delete rval;
         throw;

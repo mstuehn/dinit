@@ -17,6 +17,7 @@
 #include "load-service.h"
 #include "dinit-ll.h"
 #include "dinit-log.h"
+#include "options-processing.h" // TODO maybe remove, service_dir_pathlist can be moved?
 
 /*
  * This header defines service_record, a data record maintaining information about a service,
@@ -111,29 +112,6 @@
  * transition stage, at the latest.
  */
 
-struct service_flags_t
-{
-    // on-start flags:
-    bool rw_ready : 1;  // file system should be writable once this service starts
-    bool log_ready : 1; // syslog should be available once this service starts
-    
-    // Other service options flags:
-    bool no_sigterm : 1;  // do not send SIGTERM
-    bool runs_on_console : 1;  // run "in the foreground"
-    bool starts_on_console : 1; // starts in the foreground
-    bool shares_console : 1;    // run on console, but not exclusively
-    bool pass_cs_fd : 1;  // pass this service a control socket connection via fd
-    bool start_interruptible : 1; // the startup of this service process is ok to interrupt with SIGINT
-    bool skippable : 1;   // if interrupted the service is skipped (scripted services)
-    bool signal_process_only : 1;  // signal the session process, not the whole group
-    
-    service_flags_t() noexcept : rw_ready(false), log_ready(false), no_sigterm(false),
-            runs_on_console(false), starts_on_console(false), shares_console(false),
-            pass_cs_fd(false), start_interruptible(false), skippable(false), signal_process_only(false)
-    {
-    }
-};
-
 class service_record;
 class service_set;
 class base_process_service;
@@ -151,6 +129,13 @@ class service_dep
     bool holding_acq;
 
     const dependency_type dep_type;
+
+    // Check if the dependency is a hard dependency (including milestone still waiting).
+    bool is_hard()
+    {
+        return dep_type == dependency_type::REGULAR
+                || (dep_type == dependency_type::MILESTONE && waiting_on);
+    }
 
     service_dep(service_record * from, service_record * to, dependency_type dep_type_p) noexcept
             : from(from), to(to), waiting_on(false), holding_acq(false), dep_type(dep_type_p)
@@ -179,7 +164,7 @@ class prelim_dep
 
     prelim_dep(service_record *to_p, dependency_type dep_type_p) : to(to_p), dep_type(dep_type_p)
     {
-        //
+        // (constructor)
     }
 };
 
@@ -230,7 +215,7 @@ class service_record
     bool prop_start   : 1;
     bool prop_stop    : 1;
 
-    bool restarting   : 1;      // re-starting after unexpected termination
+    bool restarting   : 1;      // re-start after stopping
     bool start_failed : 1;      // failed to start (reset when begins starting)
     bool start_skipped : 1;     // start was skipped by interrupt
     
@@ -340,8 +325,6 @@ class service_record
     // Release console (console must be currently held by this service)
     void release_console() noexcept;
     
-    bool do_auto_restart() noexcept;
-
     // Started state reached
     bool process_started() noexcept;
 
@@ -459,6 +442,12 @@ class service_record
         return desired_state;
     }
 
+    // Is the service explicitly marked active?
+    bool is_marked_active() noexcept
+    {
+        return start_explicit;
+    }
+
     // Set logfile, should be done before service is started
     void set_log_file(const string &logfile)
     {
@@ -507,6 +496,7 @@ class service_record
     
     void start(bool activate = true) noexcept;  // start the service
     void stop(bool bring_down = true) noexcept;   // stop the service
+    bool restart() noexcept; // restart the service, returns true iff restart issued
     
     void forced_stop() noexcept; // force-stop this service and all dependents
     
@@ -604,6 +594,11 @@ class service_record
     dep_list & get_dependencies()
     {
         return depends_on;
+    }
+
+    dpt_list & get_dependents()
+    {
+        return dependents;
     }
 
     // Add a dependency. Caller must ensure that the services are in an appropriate state and that
@@ -813,7 +808,7 @@ class service_set
                 auto next = prop_queue.pop_front();
                 next->do_propagation();
             }
-            while (! stop_queue.is_empty()) {
+            if (! stop_queue.is_empty()) {
                 auto next = stop_queue.pop_front();
                 next->execute_transition();
             }
@@ -910,35 +905,10 @@ class service_set
     }
 };
 
-// A service directory entry, tracking the directory as a nul-terminated string, which may either
-// be static or dynamically allocated (via new char[...]).
-class service_dir_entry
-{
-    const char *dir;
-    bool dir_dyn_allocd;  // dynamically allocated?
-
-    public:
-    service_dir_entry(const char *dir_p, bool dir_dyn_allocd_p) :
-        dir(dir_p), dir_dyn_allocd(dir_dyn_allocd_p)
-    { }
-
-    ~service_dir_entry()
-    {
-        if (dir_dyn_allocd) {
-            delete[] dir;
-        }
-    }
-
-    const char *get_dir() const
-    {
-        return dir;
-    }
-};
-
 // A service set which loads services from one of several service directories.
 class dirload_service_set : public service_set
 {
-    std::vector<service_dir_entry> service_dirs; // directories containing service descriptions
+    service_dir_pathlist service_dirs;
 
     public:
     dirload_service_set() : service_set()
@@ -946,22 +916,12 @@ class dirload_service_set : public service_set
         // nothing to do.
     }
 
+    dirload_service_set(service_dir_pathlist &&pathlist) : service_set(), service_dirs(std::move(pathlist))
+    {
+        // nothing to do.
+    }
+
     dirload_service_set(const dirload_service_set &) = delete;
-
-    // Construct a dirload_service_set which loads services from the specified directory. The
-    // directory specified can be dynamically allocated via "new char[...]" (dyn_allocd == true)
-    // or statically allocated.
-    dirload_service_set(const char *service_dir_p, bool dyn_allocd = false) : service_set()
-    {
-        service_dirs.emplace_back(service_dir_p, dyn_allocd);
-    }
-
-    // Append a directory to the list of service directories, so that it is searched last for
-    // service description files.
-    void add_service_dir(const char *service_dir_p, bool dyn_allocd = true)
-    {
-        service_dirs.emplace_back(service_dir_p, dyn_allocd);
-    }
 
     int get_service_dir_count()
     {

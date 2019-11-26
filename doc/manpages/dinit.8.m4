@@ -1,4 +1,5 @@
-.TH DINIT "8" "June 2019" "Dinit 0.5.2" "Dinit \- service management system"
+changequote(`@@@',`$$$')dnl
+@@@.TH DINIT "8" "$$$MONTH YEAR@@@" "Dinit $$$VERSION@@@" "Dinit \- service management system"
 .SH NAME
 dinit \- supervise processes and manage services
 .\"
@@ -76,7 +77,7 @@ Run with no output to the terminal/console. This disables service status message
 and sets the log level for the console log to \fBNONE\fR.
 .TP
 \fB\-\-help\fR
-display this help and exit
+Display brief help text and then exit.
 .TP
 \fIservice-name\fR
 Specifies the name of a service that should be started (along with its
@@ -175,3 +176,4 @@ and exit Dinit; SIGQUIT exits Dinit immediately.
 .\"
 .SH AUTHOR
 Dinit, and this manual, were written by Davin McCall.
+$$$dnl

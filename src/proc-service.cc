@@ -1,4 +1,5 @@
 #include <cstring>
+#include <type_traits>
 
 #include <sys/un.h>
 #include <sys/socket.h>
@@ -14,6 +15,20 @@
  *
  * See proc-service.h header for interface details.
  */
+
+// Strings describing the execution stages (failure points).
+const char * const exec_stage_descriptions[static_cast<int>(exec_stage::DO_EXEC) + 1] = {
+        "arranging file descriptors",   // ARRANGE_FDS
+        "reading environment file",     // READ_ENV_FILE
+        "setting environment variable", // SET_NOTIFYFD_VAR
+        "setting up activation socket", // SETUP_ACTIVATION_SOCKET
+        "setting up control socket",    // SETUP_CONTROL_SOCKET
+        "changing directory",           // CHDIR
+        "setting up standard input/output descriptors", // SETUP_STDINOUTERR
+        "setting resource limits",      // SET_RLIMITS
+        "setting user/group ID",        // SET_UIDGID
+        "executing command"             // DO_EXEC
+};
 
 // Given a string and a list of pairs of (start,end) indices for each argument in that string,
 // store a null terminator for the argument. Return a `char *` vector containing the beginning
@@ -76,8 +91,8 @@ rearm exec_status_pipe_watcher::fd_event(eventloop_t &loop, int fd, int flags) n
     base_process_service *sr = service;
     sr->waiting_for_execstat = false;
 
-    int exec_status;
-    int r = read(get_watched_fd(), &exec_status, sizeof(int));
+    run_proc_err exec_status;
+    int r = read(get_watched_fd(), &exec_status, sizeof(exec_status));
     deregister(loop);
     close(get_watched_fd());
 
@@ -172,7 +187,6 @@ void process_service::handle_exit_status(bp_sys::exit_status exit_status) noexce
 {
     bool did_exit = exit_status.did_exit();
     bool was_signalled = exit_status.was_signalled();
-    restarting = false;
     auto service_state = get_state();
 
     if (notification_fd != -1) {
@@ -224,9 +238,10 @@ void process_service::handle_exit_status(bp_sys::exit_status exit_status) noexce
     services->process_queues();
 }
 
-void process_service::exec_failed(int errcode) noexcept
+void process_service::exec_failed(run_proc_err errcode) noexcept
 {
-    log(loglevel_t::ERROR, get_name(), ": execution failed: ", strerror(errcode));
+    log(loglevel_t::ERROR, get_name(), ": execution failed - ",
+            exec_stage_descriptions[static_cast<int>(errcode.stage)], strerror(errcode.st_errno));
 
     if (notification_fd != -1) {
         readiness_watcher.deregister(event_loop);
@@ -266,7 +281,7 @@ void bgproc_service::handle_exit_status(bp_sys::exit_status exit_status) noexcep
     // This may be a "smooth recovery" where we are restarting the process while leaving the
     // service in the STARTED state.
     if (restarting && service_state == service_state_t::STARTED) {
-        restarting = false;
+        //restarting = false;
         bool need_stop = false;
         if ((did_exit && exit_status.get_exit_status() != 0) || was_signalled) {
             need_stop = true;
@@ -298,7 +313,7 @@ void bgproc_service::handle_exit_status(bp_sys::exit_status exit_status) noexcep
         return;
     }
 
-    restarting = false;
+    //restarting = false;
     if (service_state == service_state_t::STARTING) {
         // POSIX requires that if the process exited clearly with a status code of 0,
         // the exit status value will be 0:
@@ -335,10 +350,6 @@ void bgproc_service::handle_exit_status(bp_sys::exit_status exit_status) noexcep
             do_smooth_recovery();
             return;
         }
-        if (! do_auto_restart() && start_explicit) {
-            start_explicit = false;
-            release(false);
-        }
         stop_reason = stopped_reason_t::TERMINATED;
         forced_stop();
         stop_dependents();
@@ -347,9 +358,11 @@ void bgproc_service::handle_exit_status(bp_sys::exit_status exit_status) noexcep
     services->process_queues();
 }
 
-void bgproc_service::exec_failed(int errcode) noexcept
+void bgproc_service::exec_failed(run_proc_err errcode) noexcept
 {
-    log(loglevel_t::ERROR, get_name(), ": execution failed: ", strerror(errcode));
+    log(loglevel_t::ERROR, get_name(), ": execution failed - ",
+            exec_stage_descriptions[static_cast<int>(errcode.stage)], strerror(errcode.st_errno));
+
     // Only time we execute is for startup:
     stop_reason = stopped_reason_t::EXECFAILED;
     failed_to_start();
@@ -439,9 +452,10 @@ void scripted_service::handle_exit_status(bp_sys::exit_status exit_status) noexc
     }
 }
 
-void scripted_service::exec_failed(int errcode) noexcept
+void scripted_service::exec_failed(run_proc_err errcode) noexcept
 {
-    log(loglevel_t::ERROR, get_name(), ": execution failed: ", strerror(errcode));
+    log(loglevel_t::ERROR, get_name(), ": execution failed - ",
+            exec_stage_descriptions[static_cast<int>(errcode.stage)], strerror(errcode.st_errno));
     auto service_state = get_state();
     if (service_state == service_state_t::STARTING) {
         stop_reason = stopped_reason_t::EXECFAILED;
@@ -452,6 +466,12 @@ void scripted_service::exec_failed(int errcode) noexcept
         // STOPPING state:
         stopped();
     }
+}
+
+// Return a value as an unsigned-type value.
+template <typename T> typename std::make_unsigned<T>::type make_unsigned_val(T val)
+{
+    return static_cast<typename std::make_unsigned<T>::type>(val);
 }
 
 bgproc_service::pid_result_t
@@ -479,7 +499,7 @@ bgproc_service::read_pid_file(bp_sys::exit_status *exit_status) noexcept
     bool valid_pid = false;
     try {
         unsigned long long v = std::stoull(pidbuf, nullptr, 0);
-        if (v <= std::numeric_limits<pid_t>::max()) {
+        if (v <= make_unsigned_val(std::numeric_limits<pid_t>::max())) {
             pid = (pid_t) v;
             valid_pid = true;
         }

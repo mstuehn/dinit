@@ -15,6 +15,11 @@ template <int SIZE> class cpbuffer
     int length = 0;  // number of elements in the buffer
     
     public:
+    static constexpr int get_size()
+    {
+        return SIZE;
+    }
+
     int get_length() noexcept
     {
         return length;
@@ -99,7 +104,7 @@ template <int SIZE> class cpbuffer
     char operator[](int idx) noexcept
     {
         int dest_idx = cur_idx + idx;
-        if (dest_idx > SIZE) dest_idx -= SIZE;
+        if (dest_idx >= SIZE) dest_idx -= SIZE;
         return buf[dest_idx];
     }
     
